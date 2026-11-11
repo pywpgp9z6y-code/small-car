@@ -20,6 +20,10 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "car_config.h"
+#include "motor.h"
+#include "special.h"
+#include "timebase.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -169,11 +173,6 @@ int fputc(int ch, FILE *f)
 float gyro_x, gyro_y, gyro_z, accel_x, accel_y, accel_z; // 陀螺仪数据
 
 /* ================= 小车赛控制代码================= */
-#define PWM_MAX      6000.0f     // TIM1 Period
-#define SPEED_DIV    10          // 1kHz -> 100Hz 速度环
-#define INTEG_LIMIT  30000.0f
-#define BASE_SPEED   40.0f      // 目标速度，脉冲/10ms
-#define TURN_MAX     25.0f       // 方向环输出 turn 的限幅
 
 /* 20 cm 方块直角弯的 0/40 方案：
    直道 BASE=30；
@@ -181,73 +180,32 @@ float gyro_x, gyro_y, gyro_z, accel_x, accel_y, accel_z; // 陀螺仪数据
    targetL=0、targetR=40，平均 20，
    R=16×20/40=8 cm。
    外轮只有 40，不是 54/60；车心降到 20，是低速 pivot。 */
-#define CURVE_SLOW      0.5f
-#define MIN_CURVE_SPEED 20.0f
 
 /* 方向环二次项修正：
    Kp=2.5 时最大误差 5.5 给 13.75，二次项补到约 20：
      2.5×5.5 + 0.21×30.25 ≈ 13.75 + 6.35 ≈ 20.1
      误差 1 时：2.5 + 0.21 ≈ 2.71（中心附近仍然软）
    最大 turn=20，配合 speed_cmd=20，正好 target=0/40。 */
-#define DIR_QUAD     0.21f
 
 /* 过弯状态机：
    线一回中，纯 PID 会松舵；这里在检测到大误差时锁存方向，
    固定 turn/speed 保持一段时间，直到陀螺转过 70° 或线稳定回来。
    方向环 100 Hz，所以 CORNER_*_TICKS 的单位是 10 ms。 */
-#define CORNER_ENTER_ERR    3.0f
-#define CORNER_ENTER_TURN   8.0f
-#define CORNER_SPEED        25.0f
-#define CORNER_YAW_EXIT     70.0f
-#define CORNER_MIN_TICKS    12U    /* 120 ms */
-#define CORNER_MAX_TICKS    40U    /* 400 ms 兜底 */
-#define CORNER_COOLDOWN     20U    /* 200 ms 内不重复触发 */
-#define CORNER_RAMP_TICKS   15U    /* 出弯 150 ms 速度斜坡 */
 
 /* 六边形入口：实测 435.7 counts/cm（推车 100 cm 标定）。
    11/12 上升沿算一次；第一次 arm，第二次才打右舵。
    两次之间要求车已走过 2 cm（≈871 counts），
    避免同一个 11/12 脉冲被数两次，又不会像 4 cm 那样等太久。 */
-#define COUNTS_PER_CM       435.7f
-#define HEX_CLEAR_CM        0.0f
-#define HEX_CLEAR_COUNTS    ((uint32_t)(COUNTS_PER_CM * HEX_CLEAR_CM))
-#define HEX_OFF_TICKS       1U     /* 至少熄灭 1 拍才算新事件 */
-#define HEX_PRE_TURN_TICKS  20U    /* 第一次先预转 200 ms，先过第一个顶点 */
-#define HEX_PRE_TURN        16.0f  /* 预转舵量，比半舵再大一点 */
-#define HEX_PRE_SPEED       20.0f  /* 预转时降速，避免顶点顶住/丢线 */
-#define HEX_TURN_TICKS      15U    /* 第二次确认后满舵 150 ms */
-#define HEX_ARM_TIMEOUT     500U   /* 第一次后 5 s 没等到第二次就复位 */
 
 /* 原地转 360°：串口输入 '2' 触发 */
-#define SPIN_TARGET_DEG     360.0f
-#define SPIN_STOP_DEG       360.0f
-#define SPIN_KP             0.6f
-#define SPIN_MAX            35.0f
-#define SPIN_MIN            30.0f
-#define SPIN_KICK           42.0f   /* 起步短时大扭矩 */
-#define SPIN_KICK_TICKS     18U     /* 120 ms */
-#define SPIN_TIMEOUT        2000U    /* 20 s 兜底，含 3 次 1 s 停顿 */
-#define SPIN_STAGE_COUNT    4U
-#define SPIN_PAUSE_TICKS    100U     /* 100 × 10ms = 1 s */
-#define SPIN_STAGE_TOL      3.0f     /* 到目标 ±3° 就进入停顿 */
 
 /* 脱线直线走 1 m：串口输入 '3' 触发 */
-#define STRAIGHT_TARGET_COUNTS  43570U   /* 435.7 × 100 cm */
-#define STRAIGHT_SPEED          60.0f
-#define STRAIGHT_MIN_SPEED      20.0f
-#define STRAIGHT_DECEL_COUNTS   2178U    /* 最后 5 cm 开始减速 */
-#define STRAIGHT_KP             1.0f
-#define STRAIGHT_KD             0.1f
-#define STRAIGHT_TURN_MAX       10.0f
-#define STRAIGHT_TIMEOUT        1000U    /* 10 s 兜底 */
 
 /* 前馈：基础占空比 = FF_GAIN × 目标速度。target = 20 时 60 × 20 = 1200（约 17% 占空比）。
    没有前馈时，Kp=0.5 在误差 100 时只给 50，车根本推不动，光靠积分要爬十几秒。
    标定方法：先把 pid_L / pid_R 的 Kp、Ki 都置 0、只留前馈，
    调 FF_GAIN 到车能匀速慢走，再加回 PID 修偏差。 */
 //尤其注意FF_GAIN和速度无关，却对硬件参数高度依赖
-#define FF_GAIN_L       14.5f
-#define FF_GAIN_R       15.4f
 
 
 /* 死区补偿：占空比低于某个值时电机根本转不起来（静摩擦），
@@ -255,8 +213,6 @@ float gyro_x, gyro_y, gyro_z, accel_x, accel_y, accel_z; // 陀螺仪数据
    表现为车一顿一顿、蛇行（积分饱和典型症状）
 复习：一开始上不去，积分项上去后启动，却下不来，就会过加速
    标定方法：开环把 TIM1->CCR1 从 0 慢慢加，记下轮子刚开始转的值，取稍大一点。 */
-#define MOTOR_MIN_DUTY_L 150.0f
-#define MOTOR_MIN_DUTY_R 169.0f
 
 /* 起步 kick：运行到 20 只需 290/308，但静止起转要 390/428。
    地面实测：连续给 390/428 很容易把车一脚踢到 35~46，然后 FF 保持
@@ -264,20 +220,10 @@ float gyro_x, gyro_y, gyro_z, accel_x, accel_y, accel_z; // 陀螺仪数据
      390/428 给 60 ms → 0 给 60 ms → 重复，直到两轮都 > 4，
      或总时长 600 ms。
    起来后如果速度已经超过 BASE+2，先 0 占空比滑行，不继续给 FF。 */
-#define KICK_L            390.0f
-#define KICK_R            428.0f
-#define KICK_ON_TICKS     6U      /* 60 ms on */
-#define KICK_OFF_TICKS    6U      /* 60 ms off */
-#define KICK_MAX_TICKS    60U     /* 总 kick 上限 600 ms */
-#define KICK_EXIT_SPEED   4.0f    /* 两轮都 >4 就认为已经动起来 */
-#define SETTLE_TICKS      15U     /* 起来后 FF 保持 150 ms，再开 PID */
 
 /* 中途卡住恢复：速度接近 0 持续 300 ms，就重新脉冲 kick。
    高阻尼/接缝/地毯段，正常运行 FF 290/308 可能推不动，
    需要再给 390/428 的短脉冲。最多重试 3 次，避免一直顶住。 */
-#define STALL_SPEED       2.0f
-#define STALL_TICKS       30U     /* 30 × 10 ms = 300 ms */
-#define STALL_RETRIES     3U
 /* 现场微调：
    - 起不来：KICK_ON_TICKS 加到 8~10，或 KICK_MAX_TICKS 加到 80
    - 起来还冲：KICK_ON_TICKS 降到 4，或 KICK_EXIT_SPEED 降到 3
@@ -285,7 +231,6 @@ float gyro_x, gyro_y, gyro_z, accel_x, accel_y, accel_z; // 陀螺仪数据
 
 /* 丢线停车阈值：方向环跑 50 Hz，10 拍 = 200 ms 连续读不到线就停车。
    太短会被赛道接缝/贴纸误触发，太长会冲出赛道。实测再调。 */
-#define LOST_STOP_TICKS 150U
 
 
 /* ---- 调试打印：把中断里算出来的实测速度抄到全局变量，由主循环负责打印 ----
@@ -342,7 +287,6 @@ static void Launch_Reset(void)
 }
 
 /* ================= 陀螺仪（BMI270 角速度 z 轴） ================= */
-#define GYRO_ALPHA 0.3f              /* 一阶低通系数，200 Hz 采样下约 9.5 Hz 截止 */
 
 static float gyro_z_bias = 0.0f;     /* 静态零偏，开机静止标定得到 */
 static float gyro_z_filt = 0.0f;     /* 去零偏 + 低通后的角速度，单位 °/s */
@@ -366,23 +310,7 @@ static void Gyro_Calibrate(void)
     dbg_gyro_z  = 0.0f;
 }
 
-//速度环
-
-typedef struct {
-    float Kp, Ki, Kd;
-    float target;
-    float measure;
-    float error;
-    float pre_error;
-    float integral;
-    float output;
-} PID_t;
-
-
-
-static PID_t pid_L = { .Kp = 2.5f, .Ki = 0.01f, .Kd = 0.0f };
-static PID_t pid_R = { .Kp = 2.5f, .Ki = 0.01f, .Kd = 0.0f };
-
+//速度环状态保留在 main.c，PID 结构/算法已移到 motor.c
 static int16_t last_L = 0, last_R = 0;
 
 /* 编码器增量合理性保护：
@@ -390,7 +318,6 @@ static int16_t last_L = 0, last_R = 0;
    原来限 100 会把正常高速也当成坏采样，速度反馈卡在 99/91，
    PID 看不到真实车速，车反而刹不住、进弯发抖。
    现在放到 300：正常高速能测到，21159 这种 32k 坏采样仍然会被拒绝。 */
-#define ENC_DELTA_LIMIT 300
 static int16_t last_valid_dL = 0, last_valid_dR = 0;
 
 /* 低速增益调度：
@@ -401,146 +328,26 @@ static int16_t last_valid_dL = 0, last_valid_dR = 0;
      0 速 → Kp=6.0，P=120，总输出约 410，能自己起转；
      接近 10 → 平滑回到 1.5，巡航不放大噪声。
    只放大 P，不改 FF/Ki/最小占空比，避免影响稳态和巡航。 */
-#define KP_LOW_SPEED 10.0f
-#define KP_BOOST     2.5f
 
-static float PID_Calc(PID_t *p, float measure)
-{
-    float kp;
-
-    p->measure   = measure;
-    p->pre_error = p->error;
-    p->error     = p->target - p->measure;
-    p->integral += p->error;
-    if (p->integral >  INTEG_LIMIT) p->integral =  INTEG_LIMIT;
-    if (p->integral < -INTEG_LIMIT) p->integral = -INTEG_LIMIT;
-
-    kp = p->Kp;
-    if (p->measure < KP_LOW_SPEED && p->target > p->measure)
-    {
-        float ratio = 1.0f - p->measure / KP_LOW_SPEED;
-        if (ratio > 1.0f) ratio = 1.0f;
-        if (ratio < 0.0f) ratio = 0.0f;
-        kp = p->Kp * (1.0f + (KP_BOOST - 1.0f) * ratio);
-    }
-
-    p->output = kp * p->error
-              + p->Ki * p->integral
-              + p->Kd * (p->error - p->pre_error);
-
-    // 输出限幅 + 抗 windup：饱和且误差同向时回退积分//？
-    if (p->output >  PWM_MAX) { p->output =  PWM_MAX; if (p->error > 0) p->integral -= p->error; }
-    if (p->output < -PWM_MAX) { p->output = -PWM_MAX; if (p->error < 0) p->integral -= p->error; }
-    return p->output;
-}
-
-//电机输出方向大小控制
-static void Motor_Output(float out_L, float out_R)
-{
-		/* 为前馈添加限幅：前馈 + PID 叠加后可能超出 CCR 范围 */
-    if (out_L >  PWM_MAX) out_L =  PWM_MAX;
-    if (out_L < -PWM_MAX) out_L = -PWM_MAX;
-    if (out_R >  PWM_MAX) out_R =  PWM_MAX;
-    if (out_R < -PWM_MAX) out_R = -PWM_MAX;
-
-    /* 死区补偿：只在“目标比实测快”时抬到最小值；
-       超速时不要抬，否则车降不下来。 */
-    if (out_L > 0.0f && out_L < MOTOR_MIN_DUTY_L && pid_L.target > pid_L.measure) out_L = MOTOR_MIN_DUTY_L;
-    if (out_L < 0.0f && out_L > -MOTOR_MIN_DUTY_L && pid_L.target > pid_L.measure) out_L = -MOTOR_MIN_DUTY_L;
-    if (out_R > 0.0f && out_R < MOTOR_MIN_DUTY_R && pid_R.target > pid_R.measure) out_R = MOTOR_MIN_DUTY_R;
-    if (out_R < 0.0f && out_R > -MOTOR_MIN_DUTY_R && pid_R.target > pid_R.measure) out_R = -MOTOR_MIN_DUTY_R;
-
-    /* 前进时不允许 PID 过冲把电机拉到反转；超速只允许降到 0 滑行 */
-    if (pid_L.target >= 0.0f && out_L < 0.0f) out_L = 0.0f;
-    if (pid_R.target >= 0.0f && out_R < 0.0f) out_R = 0.0f;
-
-    if (out_L >= 0) {
-        TIM1->CCR1 = (uint32_t)out_L;
-        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_RESET);   // L_DIR 前进电平，实测确认
-    } else {
-        TIM1->CCR1 = (uint32_t)(-out_L);
-        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_SET);
-    }
-    if (out_R >= 0) {
-        TIM1->CCR2 = (uint32_t)out_R;
-        HAL_GPIO_WritePin(GPIOA, GPIO_PIN_10, GPIO_PIN_RESET);   // R_DIR
-    } else {
-        TIM1->CCR2 = (uint32_t)(-out_R);
-        HAL_GPIO_WritePin(GPIOA, GPIO_PIN_10, GPIO_PIN_SET);
-    }
-}
+/* PID_Calc / Motor_Output 已移到 motor.c */
 
 
-//转向环
-typedef struct {
-    float Kp, Ki;
-    float target;        // 目标偏差 = 0（希望线在中间）
-    float measure;       // 实际偏差 error
-    float error, pre_error, integral;
-    float output;        // turn
-} DirPID_t;
-
-static DirPID_t dir_pid = { .Kp = 2.5f, .Ki = 0.0f, .target = 0.0f };
-static float DirPID_Calc(DirPID_t *p, float measure)
-{
-    p->measure   = measure;
-    p->pre_error = p->error;
-    p->error     = p->target - p->measure;   // = 0 - error = -error
-
-    p->integral += p->error;
-    // 积分限幅、输出限幅（turn 不能太大，否则两轮目标一个正一个负）
-    if (p->integral >  INTEG_LIMIT) p->integral =  INTEG_LIMIT;
-    if (p->integral < -INTEG_LIMIT) p->integral = -INTEG_LIMIT;
-
-    p->output = p->Kp * p->error + p->Ki * p->integral;
-    // turn 限幅到 ±base_speed 以内，保证两轮目标不全为负
-    if (p->output >  TURN_MAX) p->output =  TURN_MAX;
-    if (p->output < -TURN_MAX) p->output = -TURN_MAX;
-    return p->output;
-}
+/* DirPID_t / dir_pid / DirPID_Calc 已移到 motor.c */
 
 /* 丢线计数：方向环每 10 ms 累加一次，读到线就清零 */
 static uint16_t lost_cnt = 0;
 
-/* 过弯状态机 */
-static uint8_t  corner_state = 0U;
-static float    corner_dir = 1.0f;
-static float    corner_yaw = 0.0f;
-static uint16_t corner_ticks = 0U;
-static uint16_t corner_cooldown = 0U;
-static uint16_t corner_ramp_ticks = 0U;
+/* 过弯状态机（实现已移到 special.c） */
+static CornerState corner;
 
-/* 六边形入口检测状态 */
-static uint8_t  hex_right_prev = 0U;
-static uint16_t hex_off_cnt = 0U;
-static uint16_t hex_on_cnt = 0U;
-
-static uint8_t  hex_left_prev = 0U;
-static uint16_t hex_left_off_cnt = 0U;
-static uint16_t hex_left_on_cnt = 0U;
-
-static float    hex_dir = -1.0f;   /* -1 = 右转，+1 = 左转 */
-static uint16_t hex_event_cnt = 0U;
-static uint16_t hex_arm_ticks = 0U;
-static uint16_t hex_preturn_ticks = 0U;
-static uint16_t hex_turn_ticks = 0U;
-static uint32_t hex_dist = 0U;
-static uint16_t hex_evt_seq = 0U;
-static uint8_t  hex_dbg_event = 0U;
-static uint32_t hex_dbg_dist = 0U;
-static uint8_t  hex_dbg_right = 0U;
-static uint8_t  hex_dbg_left = 0U;
-static uint8_t  hex_dbg_center = 0U;
-static uint16_t hex_dbg_mask = 0U;
+/* 六边形入口检测状态（实现已移到 special.c） */
+static HexState hex;
 
 /* 串口命令 + 原地转 360° 状态 */
 static volatile uint8_t  spin_request = 0U;
 static volatile uint8_t  spin_mode = 0U;
 static float    spin_yaw = 0.0f;
 static uint16_t spin_ticks = 0U;
-static uint8_t  spin_stage = 0U;
-static uint8_t  spin_paused = 0U;
-static uint16_t spin_pause_ticks = 0U;
 static uint8_t  uart_rx_byte = 0U;
 
 /* 脱线直线 1 m 状态 */
@@ -565,31 +372,13 @@ static void Car_Stop(void)
     speed_cmd = 0.0f;
     Launch_Reset();
     lost_cnt = 0;
-    corner_state = 0U;
-    corner_cooldown = 0U;
-    corner_ramp_ticks = 0U;
-    corner_yaw = 0.0f;
-    corner_ticks = 0U;
+    Corner_Reset(&corner);
 
-    hex_right_prev = 0U;
-    hex_off_cnt = 0U;
-    hex_on_cnt = 0U;
-    hex_left_prev = 0U;
-    hex_left_off_cnt = 0U;
-    hex_left_on_cnt = 0U;
-    hex_dir = -1.0f;
-    hex_event_cnt = 0U;
-    hex_arm_ticks = 0U;
-    hex_preturn_ticks = 0U;
-    hex_turn_ticks = 0U;
-    hex_dist = 0U;
+    Hex_Reset(&hex);
 
     spin_mode = 0U;
     spin_yaw = 0.0f;
     spin_ticks = 0U;
-    spin_stage = 0U;
-    spin_paused = 0U;
-    spin_pause_ticks = 0U;
 
     straight_mode = 0U;
     straight_yaw = 0.0f;
@@ -616,20 +405,13 @@ static void Spin_Start(void)
 
     spin_yaw = 0.0f;
     spin_ticks = 0U;
-    spin_stage = 0U;
-    spin_paused = 0U;
-    spin_pause_ticks = 0U;
     straight_mode = 0U;
     spin_mode = 1U;
 }
 
-/* 方向环 100 Hz 调用：90→180→270→360，每段停 1 s */
+/* 方向环 100 Hz 调用：陀螺积分 + 角度闭环 */
 static void Spin_Update(void)
 {
-    static const float spin_targets[SPIN_STAGE_COUNT] = {
-        90.0f, 180.0f, 270.0f, 360.0f
-    };
-
     if (!gyro_ok) {
         Car_Stop();
         return;
@@ -638,66 +420,19 @@ static void Spin_Update(void)
     spin_yaw += gyro_z_filt * 0.01f;   /* 100 Hz，dt=10ms */
     ++spin_ticks;
 
-    if (spin_ticks >= SPIN_TIMEOUT) {
-        Car_Stop();
-        return;
-    }
-
-    /* 段间停顿：左右目标 0，停 1 s 再进入下一段 */
-    if (spin_paused)
-    {
-        pid_L.target = 0.0f;
-        pid_R.target = 0.0f;
-
-        if (spin_pause_ticks > 0U)
-            --spin_pause_ticks;
-
-        if (spin_pause_ticks == 0U)
-        {
-            spin_paused = 0U;
-            if (spin_stage >= SPIN_STAGE_COUNT)
-            {
-                Car_Stop();
-                return;
-            }
-        }
-        return;
-    }
-
-    if (spin_stage >= SPIN_STAGE_COUNT)
-    {
-        Car_Stop();
-        return;
-    }
-
     float yaw_abs = (spin_yaw >= 0.0f) ? spin_yaw : -spin_yaw;
-    float target = spin_targets[spin_stage];
 
-    /* 到达本段目标，进入 1 s 停顿 */
-    if (yaw_abs >= target - SPIN_STAGE_TOL)
-    {
-        pid_L.target = 0.0f;
-        pid_R.target = 0.0f;
-        ++spin_stage;
-
-        /* 90/180/270 后停 1 s；到 360 直接停，不再多等 */
-        if (spin_stage >= SPIN_STAGE_COUNT)
-        {
-            Car_Stop();
-            return;
-        }
-
-        spin_paused = 1U;
-        spin_pause_ticks = SPIN_PAUSE_TICKS;
+    if (yaw_abs >= SPIN_STOP_DEG || spin_ticks >= SPIN_TIMEOUT) {
+        Car_Stop();
         return;
     }
 
-    float err = target - yaw_abs;
+    float err = SPIN_TARGET_DEG - yaw_abs;
     float cmd;
 
-    if (spin_stage == 0U && spin_ticks <= SPIN_KICK_TICKS)
+    if (spin_ticks <= SPIN_KICK_TICKS)
     {
-        /* 只在起转第一段硬踹一下，打破静摩擦 */
+        /* 前 120 ms 硬踹一下，打破静摩擦 */
         cmd = SPIN_KICK;
     }
     else
@@ -795,9 +530,8 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 
 //时基
 
-void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+void Control_Update(void)
 {
-    if (htim->Instance == TIM2) {            // 1kHz
         /*陀螺仪测定
 				dodo_BMI270_get_data();
 				gyro_z = BMI270_gyro_transition(BMI270_gyro_z);
@@ -817,8 +551,6 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
                 dbg_gyro_z = gyro_z_filt;
             }
         }
-
-        
 
         /* 方向环：100 Hz（10 ms） */
         static uint16_t div_dir = 0, div_speed = 0;
@@ -848,247 +580,59 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
                 error = bias - 5.5f;
             }
 
-            /* 六边形入口检测：5~8 中心 + 12 右侧分支。
-               12 上升沿算一次；第一次 arm，第二次且走过 2 cm 才打舵。 */
-            {
-                uint8_t hex_center = (
-                                      MUX_GET_CHANNEL(mux, 5) &&
-                                      MUX_GET_CHANNEL(mux, 6) 
-                                      );
-                uint8_t hex_right  = (
-                                      MUX_GET_CHANNEL(mux, 11));
-                uint8_t hex_left  = (
-                                      MUX_GET_CHANNEL(mux, 0));
+            /* 六边形入口原始传感器：状态机在 special.c */
+            uint8_t hex_center = (MUX_GET_CHANNEL(mux, 5) &&
+                                  MUX_GET_CHANNEL(mux, 6));
+            uint8_t hex_right  = MUX_GET_CHANNEL(mux, 11);
+            uint8_t hex_left   = MUX_GET_CHANNEL(mux, 0);
 
-                /* “有间隔就行”：中心与侧边之间，只要有任意一路是暗的，
-                   就认为不是十字路口的连续线，允许六边形触发。
-                   右侧看 7~10，左侧看 1~4；全亮=无间隔，不触发。 */
-                uint8_t hex_right_gap = (!MUX_GET_CHANNEL(mux, 7) ||
-                                         !MUX_GET_CHANNEL(mux, 8) ||
-                                         !MUX_GET_CHANNEL(mux, 9) ||
-                                         !MUX_GET_CHANNEL(mux, 10));
-                uint8_t hex_left_gap  = (!MUX_GET_CHANNEL(mux, 1) ||
-                                         !MUX_GET_CHANNEL(mux, 2) ||
-                                         !MUX_GET_CHANNEL(mux, 3) ||
-                                         !MUX_GET_CHANNEL(mux, 4));
-                uint16_t hex_mask = 0U;
-                for (int i = 0; i <= 11; i++) {
-                    if (MUX_GET_CHANNEL(mux, i)) hex_mask |= (uint16_t)(1U << i);
-                }
-
-                hex_dbg_right  = hex_right;
-                hex_dbg_left   = hex_left;
-                hex_dbg_center = hex_center;
-                hex_dbg_mask   = hex_mask;
-
-                if (hex_event_cnt == 1U) {
-                    if (hex_arm_ticks < 400U) ++hex_arm_ticks;
-                    if (hex_arm_ticks > HEX_ARM_TIMEOUT) hex_event_cnt = 0U;
-                }
-
-                if (hex_right) {
-                    if (!hex_right_prev && hex_off_cnt >= HEX_OFF_TICKS) {
-                        if (hex_event_cnt == 0U) {
-                            /* 第一次：只 arm，不打舵 */
-                            if (hex_center) {
-                                hex_event_cnt = 1U;
-															
-                                hex_arm_ticks = 0U;
-                                hex_dist = 0U;
-                                hex_preturn_ticks = 0U;
-                                hex_turn_ticks = 0U;
-                                hex_dir = -1.0f;
-                                corner_state = 0U;
-                                hex_dbg_event = 1U;
-                                hex_dbg_dist = hex_dist;
-                                ++hex_evt_seq;
-                            }
-                        }
-                        else if (hex_event_cnt == 1U &&
-                                 hex_dir < 0.0f &&
-                                 hex_dist >= HEX_CLEAR_COUNTS) {
-                            /* 第二次：确认右侧，满舵进入 */
-                            hex_event_cnt = 2U;
-														 
-                            hex_preturn_ticks = 0U;
-                            hex_turn_ticks = HEX_TURN_TICKS;
-                            corner_state = 0U;
-                            hex_dbg_event = 2U;
-                            hex_dbg_dist = hex_dist;
-                            ++hex_evt_seq;
-                        }
-                    }
-                    if (hex_on_cnt < 60000U) ++hex_on_cnt;
-                    hex_off_cnt = 0U;
-                }
-                else {
-                    hex_on_cnt = 0U;
-                    if (hex_off_cnt < 60000U) ++hex_off_cnt;
-                }
-                hex_right_prev = hex_right;
-
-                /* 左侧对称：ch0 上升沿 + center，立即左转 */
-                if (hex_left) {
-                    if (!hex_left_prev && hex_left_off_cnt >= HEX_OFF_TICKS) {
-                        if (hex_event_cnt == 0U) {
-                            /* 第一次：只 arm，不打舵 */
-                            if (hex_center) {
-                                hex_event_cnt = 1U;
-                                hex_arm_ticks = 0U;
-                                hex_dist = 0U;
-                                hex_preturn_ticks = 0U;
-                                hex_turn_ticks = 0U;
-                                hex_dir = 1.0f;
-                                corner_state = 0U;
-                                hex_dbg_event = 1U;
-                                hex_dbg_dist = hex_dist;
-                                ++hex_evt_seq;
-                            }
-                        }
-                        else if (hex_event_cnt == 1U &&
-                                 hex_dir > 0.0f &&
-                                 hex_dist >= HEX_CLEAR_COUNTS) {
-                            /* 第二次：确认左侧，满舵进入 */
-                            hex_event_cnt = 2U;
-                            hex_preturn_ticks = 0U;
-                            hex_turn_ticks = HEX_TURN_TICKS;
-                            corner_state = 0U;
-                            hex_dbg_event = 3U;
-                            hex_dbg_dist = hex_dist;
-                            ++hex_evt_seq;
-                        }
-                    }
-                    if (hex_left_on_cnt < 60000U) ++hex_left_on_cnt;
-                    hex_left_off_cnt = 0U;
-                }
-                else {
-                    hex_left_on_cnt = 0U;
-                    if (hex_left_off_cnt < 60000U) ++hex_left_off_cnt;
-                }
-                hex_left_prev = hex_left;
+            uint16_t hex_mask = 0U;
+            for (int i = 0; i <= 11; i++) {
+                if (MUX_GET_CHANNEL(mux, i)) hex_mask |= (uint16_t)(1U << i);
             }
 
-            float turn = 0.0f;
-            uint8_t have_control = 0U;
-
-            if (corner_state != 0U)
+            /* 方向环 PID 先算出来，交给 special 决定是否锁存 */
+            float pid_turn = 0.0f;
+            if (cnt > 0)
             {
-                /* ---- 过弯保持：固定方向 + 固定低速，不因线回中而松舵 ---- */
-                if (gyro_ok)
-                    corner_yaw += gyro_z_filt * 0.01f;   /* 100 Hz，dt=10ms */
+                pid_turn = DirPID_Calc(&dir_pid, error);
+                pid_turn += DIR_QUAD * (-error) * ((error >= 0.0f) ? error : -error);
+                if (pid_turn >  TURN_MAX) pid_turn =  TURN_MAX;
+                if (pid_turn < -TURN_MAX) pid_turn = -TURN_MAX;
+            }
 
-                ++corner_ticks;
-
-                turn = corner_dir * TURN_MAX;
-                speed_cmd = CORNER_SPEED;
-                have_control = 1U;
-
-                {
-                    float abs_yaw = (corner_yaw >= 0.0f) ? corner_yaw : -corner_yaw;
-                    float abs_err = (error >= 0.0f) ? error : -error;
-                    uint8_t line_back = (cnt > 0 && abs_err < 2.5f);
-                    uint8_t yaw_done  = (gyro_ok && abs_yaw >= CORNER_YAW_EXIT);
-                    uint8_t time_done = (corner_ticks >= CORNER_MAX_TICKS);
-                    uint8_t can_exit  = (corner_ticks >= CORNER_MIN_TICKS);
-
-                    if (can_exit &&
-                        (yaw_done ||
-                         (line_back && (gyro_ok ? (abs_yaw >= 45.0f) : (corner_ticks >= 20U))) ||
-                         time_done))
-                    {
-                        corner_state = 0U;
-                        corner_cooldown = CORNER_COOLDOWN;
-                        corner_ramp_ticks = CORNER_RAMP_TICKS;
-                    }
+            /* 丢线保护：过弯锁存期间不因线暂时消失而停 */
+            if (cnt == 0 && !Corner_IsActive(&corner))
+            {
+                if (++lost_cnt >= LOST_STOP_TICKS) {
+                    Car_Stop();
+                    return;
                 }
-
-                if (cnt > 0) lost_cnt = 0;
             }
             else
             {
-                if (corner_cooldown > 0U) --corner_cooldown;
-
-                if (cnt == 0)
-                {
-                    /* 丢线保护：连续 LOST_STOP_TICKS 拍读不到线就停车 */
-                    if (++lost_cnt >= LOST_STOP_TICKS) {
-                        Car_Stop();
-                        return;
-                    }
-                }
-                else
-                {
-                    lost_cnt = 0;
-
-                    /* 2) 方向环 PID → turn */
-                    turn = DirPID_Calc(&dir_pid, error);
-
-                    /* 大误差时补二次项 */
-                    turn += DIR_QUAD * (-error) * ((error >= 0.0f) ? error : -error);
-
-                    if (turn >  TURN_MAX) turn =  TURN_MAX;
-                    if (turn < -TURN_MAX) turn = -TURN_MAX;
-
-                    /* 3) 大误差/大 turn 进入过弯保持 */
-                    {
-                        float abs_err = (error >= 0.0f) ? error : -error;
-                        float abs_turn = (turn >= 0.0f) ? turn : -turn;
-
-                        if ((abs_err > CORNER_ENTER_ERR || abs_turn > CORNER_ENTER_TURN)
-                            && corner_cooldown == 0U)
-                        {
-                            corner_state = 1U;
-                            corner_dir = (turn >= 0.0f) ? 1.0f : -1.0f;
-                            if (abs_turn < 0.5f)
-                                corner_dir = (error > 0.0f) ? -1.0f : 1.0f;
-                            corner_yaw = 0.0f;
-                            corner_ticks = 0U;
-                            corner_ramp_ticks = 0U;
-
-                            turn = corner_dir * TURN_MAX;
-                            speed_cmd = CORNER_SPEED;
-                            have_control = 1U;
-                        }
-                    }
-
-                    if (have_control == 0U)
-                    {
-                        /* 4) 正常弯道降速 */
-                        float abs_turn = (turn >= 0.0f) ? turn : -turn;
-                        speed_cmd = BASE_SPEED - CURVE_SLOW * abs_turn;
-                        if (speed_cmd < MIN_CURVE_SPEED) speed_cmd = MIN_CURVE_SPEED;
-
-                        /* 出弯后速度斜坡，避免立刻回到 BASE 冲出去 */
-                        if (corner_ramp_ticks > 0U)
-                        {
-                            --corner_ramp_ticks;
-                            {
-                                float t = (float)(CORNER_RAMP_TICKS - corner_ramp_ticks) / (float)CORNER_RAMP_TICKS;
-                                float ramp_speed = CORNER_SPEED + (BASE_SPEED - CORNER_SPEED) * t;
-                                if (speed_cmd > ramp_speed) speed_cmd = ramp_speed;
-                            }
-                        }
-                        have_control = 1U;
-                    }
-                }
+                lost_cnt = 0;
             }
 
-            /* 六边形入口：右侧/左侧触发后按 hex_dir 打舵 */
-            if (hex_turn_ticks > 0U)
+            /* 六边形检测先跑，和原来一样先取消通用过弯锁存 */
+            HexOutput hex_out = Hex_Update(&hex, &corner,
+                                           hex_center, hex_right, hex_left, hex_mask);
+
+            uint8_t corner_was_active = Corner_IsActive(&corner);
+
+            float speed_local = BASE_SPEED;
+            float turn = Corner_Update(&corner, pid_turn, error, cnt,
+                                       gyro_ok, gyro_z_filt, &speed_local);
+            uint8_t have_control = (cnt > 0 || corner_was_active ||
+                                    Corner_IsActive(&corner)) ? 1U : 0U;
+            speed_cmd = speed_local;
+
+            /* 六边形满舵覆盖通用过弯 */
+            if (hex_out.have_control)
             {
-                turn = hex_dir * TURN_MAX;   /* -1 右转，+1 左转 */
-                speed_cmd = CORNER_SPEED;
+                turn = hex_out.turn;
+                speed_cmd = hex_out.speed_cmd;
                 have_control = 1U;
-                --hex_turn_ticks;
-                if (hex_turn_ticks == 0U) hex_event_cnt = 0U;
-            }
-            else if (hex_preturn_ticks > 0U)
-            {
-                /* 第一次事件后的预转：先把车带向分支，等第二次确认 */
-                turn = hex_dir * HEX_PRE_TURN;
-                speed_cmd = HEX_PRE_SPEED;
-                have_control = 1U;
-                --hex_preturn_ticks;
             }
 
             /* 5) 差速 → 左右目标速度（过弯/正常统一在这里写） */
@@ -1132,7 +676,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
             {
                 int32_t dL_abs = (dL < 0) ? -(int32_t)dL : (int32_t)dL;
                 int32_t dR_abs = (dR < 0) ? -(int32_t)dR : (int32_t)dR;
-                hex_dist += (uint32_t)((dL_abs + dR_abs) / 2);
+                Hex_AddDistance(&hex, (uint32_t)((dL_abs + dR_abs) / 2));
                 straight_dist += (uint32_t)((dL_abs + dR_abs) / 2);
             }
 
@@ -1247,8 +791,6 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
             Launch_Reset();               /* 下次发车重新 kick */
             return;
         }
-    }
-		// 
 }
 //
 //FF_GAIN * pid_R.target + PID_Calc(&pid_R, speed_R)
@@ -1324,7 +866,7 @@ int main(void)
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
   HAL_TIM_Encoder_Start(&htim3, TIM_CHANNEL_ALL);
   HAL_TIM_Encoder_Start(&htim4, TIM_CHANNEL_ALL);
-  HAL_TIM_Base_Start_IT(&htim2);      
+  Timebase_Init();      
 
   /* 开启 USART3 单字节接收：串口输入 '2' 触发原地转 */
   HAL_UART_Receive_IT(&huart3, &uart_rx_byte, 1U);
@@ -1417,52 +959,36 @@ int main(void)
       }
     }
 
-    /* 六边形入口事件：event=1 第一次，event=2 第二次打舵 */
+    /* 六边形入口事件 */
     {
       static uint16_t hex_last_seq = 0;
-      if (hex_evt_seq != hex_last_seq)
-      {
-        uint32_t primask = __get_PRIMASK();
-        __disable_irq();
-        uint16_t seq = hex_evt_seq;
-        uint8_t  ev  = hex_dbg_event;
-        uint32_t dist = hex_dbg_dist;
-        uint8_t  right = hex_dbg_right;
-        uint8_t  left = hex_dbg_left;
-        uint8_t  center = hex_dbg_center;
-        uint16_t mask = hex_dbg_mask;
-        __set_PRIMASK(primask);
+      HexDebug hd;
+      Hex_GetDebug(&hex, &hd);
 
-        hex_last_seq = seq;
+      if (hd.evt_seq != hex_last_seq)
+      {
+        hex_last_seq = hd.evt_seq;
         printf("HEX,%d,%lu,%d,%d,%d,%d,%d\r\n",
-               (int)ev, (unsigned long)dist,
-               (int)right, (int)left, (int)center, (int)mask, (int)seq);
+               (int)hd.event, (unsigned long)hd.event_dist,
+               (int)hd.right, (int)hd.left, (int)hd.center,
+               (int)hd.mask, (int)hd.evt_seq);
       }
     }
 
-    /* 六边形状态：每 100 ms 打印一次，用来测两次触发之间发生了什么 */
+    /* 六边形状态 */
     {
       static uint32_t hexstat_last = 0;
       if ((HAL_GetTick() - hexstat_last) >= 100U)
       {
         hexstat_last = HAL_GetTick();
 
-        uint32_t primask = __get_PRIMASK();
-        __disable_irq();
-        uint16_t event = hex_event_cnt;
-        uint16_t offR = hex_off_cnt;
-        uint16_t offL = hex_left_off_cnt;
-        uint8_t  right = hex_dbg_right;
-        uint8_t  left = hex_dbg_left;
-        uint8_t  center = hex_dbg_center;
-        uint32_t dist = hex_dist;
-        uint16_t arm = hex_arm_ticks;
-        __set_PRIMASK(primask);
+        HexDebug hd;
+        Hex_GetDebug(&hex, &hd);
 
         printf("HEXSTAT,%d,%d,%d,%d,%d,%d,%lu,%d\r\n",
-               (int)event, (int)offR, (int)offL,
-               (int)right, (int)left, (int)center,
-               (unsigned long)dist, (int)arm);
+               (int)hd.event_cnt, (int)hd.off_r, (int)hd.off_l,
+               (int)hd.right, (int)hd.left, (int)hd.center,
+               (unsigned long)hd.dist, (int)hd.arm);
       }
     }
 		
