@@ -33,6 +33,8 @@ extern TIM_HandleTypeDef htim4;
 static CarState car;
 static CornerState corner;
 static HexState hex;
+static uint8_t hex_pivot_active;   /* [原地转] 六边形入口正在原地转 */
+static float   turn_prev;          /* [SLEW 2026-11-16] 上一拍的转向命令 */
 
 /* ---- 编码器 ---- */
 static int16_t last_L = 0, last_R = 0;
@@ -71,6 +73,7 @@ static void Car_Stop(void)
     car.lost_cnt = 0U;
     Corner_Reset(&corner);
     Hex_Reset(&hex);
+    turn_prev = 0.0f;      /* [SLEW 2026-11-16] 停车后清掉斜率基准 */
 
     car.spin.mode = 0U;
     car.spin.yaw = 0.0f;
@@ -276,8 +279,22 @@ static uint8_t Control_Direction(void)
     {
         pid_turn = DirPID_Calc(&dir_pid, line.error);
         pid_turn += DIR_QUAD * (-line.error) * ((line.error >= 0.0f) ? line.error : -line.error);
+
+        /* [DAMP 2026-11-16] 陀螺阻尼：车转得越快越"收油"。
+           方向环原来是纯比例+二次项，没有阻尼，误差在中心附近来回摆 ->
+           转向命令在 +52/-52 之间瞬间翻转，电机受冲击、观感是"摆一下"。
+           gyro_z: °/s，左转为正；turn 左转为正，所以是减。 */
+        pid_turn -= DIR_DAMP * Gyro_GetZ();
+
         if (pid_turn >  TURN_MAX) pid_turn =  TURN_MAX;
         if (pid_turn < -TURN_MAX) pid_turn = -TURN_MAX;
+
+        /* [SLEW 2026-11-16] 转向限斜率：每拍最多变 TURN_SLEW。
+           正常进弯 turn 的天然变化率约 1.7/拍（误差 0->5.5 用 30 拍），
+           5/拍 的限幅根本不会介入；只在"误差突然翻符号"时削掉阶跃。 */
+        if (pid_turn > turn_prev + TURN_SLEW) pid_turn = turn_prev + TURN_SLEW;
+        if (pid_turn < turn_prev - TURN_SLEW) pid_turn = turn_prev - TURN_SLEW;
+        turn_prev = pid_turn;
     }
 
     /* 3) 丢线保护：过弯锁存期间不因线暂时消失而停 */
@@ -296,7 +313,13 @@ static uint8_t Control_Direction(void)
 
     /* 4) 六边形检测先跑，会取消通用过弯锁存 */
     hex_out = Hex_Update(&hex, &corner,
-                         line.center, line.right, line.left, line.mask);
+                         line.center, line.right, line.left, line.mask,
+                         Gyro_IsOk(), Gyro_GetZ());   /* [原地转] 陀螺闭环 */
+
+    /* [原地转] 六边形入口在做原地转时，前馈必须按 pivot 给（FF_PIVOT），
+       否则 FF_DRIVE×45 只有 144，连死区都越不过去。
+       注意：这里先清零，只有 hex 真正拿到控制权时才置 1（见下面的门控）。 */
+    hex_pivot_active = 0U;
 
     corner_was_active = Corner_IsActive(&corner);
 
@@ -328,6 +351,9 @@ static uint8_t Control_Direction(void)
         turn = hex_out.turn;
         car.speed_cmd = hex_out.speed_cmd;
         have_control = 1U;
+
+        /* [原地转] 速度目标为 0 = 在做原地转，前馈改用 FF_PIVOT */
+        hex_pivot_active = (hex_out.speed_cmd == 0.0f) ? 1U : 0U;
     }
 
     /* 5) 差速 -> 左右目标速度（过弯/正常统一在这里写） */
@@ -359,7 +385,9 @@ static uint8_t FF_IsPivotMode(void)
 {
     return (uint8_t)((car.spin.mode != 0U) ||
                      (corner.state == CORNER_ST_PIVOT) ||
-                     (corner.state == CORNER_ST_SETTLE));   /* [SETTLE 2026-11-15] 收尾段仍按原地转给前馈 */
+                     (corner.state == CORNER_ST_SETTLE) ||
+                     (corner.state == CORNER_ST_RECOVER) ||   /* [RECOVER 2026-11-16] 找线也是原地转 */
+                     (hex_pivot_active != 0U));   /* [原地转] 六边形入口原地转也按 pivot 给前馈 */
 }
 
 static float FF_L(float target)

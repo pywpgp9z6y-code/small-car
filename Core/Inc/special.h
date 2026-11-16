@@ -9,7 +9,8 @@ typedef enum {
     CORNER_ST_APPROACH = 1U,   /* 冲弯：直行 CORNER_APPROACH_CM，只保航向 */
     CORNER_ST_BRAKE    = 2U,   /* 刹停 */
     CORNER_ST_PIVOT    = 3U,   /* 原地转（粗转） */
-    CORNER_ST_SETTLE   = 4U    /* [SETTLE 2026-11-15] 航向收尾：把粗转剩下的几度补掉 */
+    CORNER_ST_SETTLE   = 4U,   /* [SETTLE 2026-11-15] 航向收尾：把粗转剩下的几度补掉 */
+    CORNER_ST_RECOVER  = 5U    /* [RECOVER 2026-11-16] 转完仍丢线：反向找 30° */
 } CornerPhase;
 
 /* 通用过弯锁存状态 */
@@ -43,25 +44,31 @@ typedef struct {
     uint8_t  cw_low;         /* 宽线之后连续正常(<=2路)拍数 */
     float    cw_side;        /* +1 左侧宽线（左转），-1 右侧 */
     uint16_t cw_ticks;       /* WIDE 状态已持续拍数 */
+    uint16_t cw_mask;        /* [诊断 2026-11-15] 进入 WIDE（定为弯口）那一拍的原始掩码 */
 
     uint8_t  armed;          /* [ARM 2026-11-15] 1=允许锁存；出弯后要等误差稳定低于阈值才重新置 1 */
     uint16_t arm_cnt;        /* [ARM 2026-11-15] 误差连续低于阈值的拍数 */
     uint16_t settle_ticks;   /* [SETTLE 2026-11-15] 收尾段计时 */
+    float    recover_dir;    /* [RECOVER 2026-11-16] 找线方向（= -dir） */
+    uint16_t recover_ticks;  /* [RECOVER 2026-11-16] 找线计时 */
 } CornerState;
 
 /* 六边形入口状态 */
 typedef struct {
-    uint8_t  right_prev;
-    uint16_t right_off_cnt;
-    uint8_t  left_prev;
-    uint16_t left_off_cnt;
+    uint8_t  v_prev;         /* [HEX-V 2026-11-15] 上一拍是否处于"严" V 型（武装边沿） */
+    uint8_t  cond_seen;      /* [诊断] 本次武装内是否已记录过"条件成立但间隔不够" */
+    uint8_t  arm_lost;       /* [FIX 2026-11-16] 武装期间连续丢线拍数，超阈值就取消武装 */
+    uint8_t  zone;           /* [HEX-ZONE] 1 = 处于六边形区间（禁用直角弯检测） */
+    uint32_t zone_dist;      /* [HEX-ZONE] 上次见到 V 时的里程 */
+    uint8_t  v_active;       /* 1 = 已确认六边形入口，正在原地转 */
+    float    v_yaw;          /* [原地转] 本次动作累计转角，° */
 
     float    dir;            /* -1 右转，+1 左转 */
-    uint16_t event_cnt;
-    uint16_t arm_ticks;
-    uint16_t preturn_ticks;
+    uint16_t event_cnt;      /* 0=无 1=第一次 V 2=已确认 */
+    uint16_t arm_ticks;      /* 调试用（V 判据不再使用武装超时） */
     uint16_t turn_ticks;
     uint32_t dist;
+    uint32_t v_dist;         /* 第一次 V 时的里程 */
     uint16_t evt_seq;
 
     uint8_t  dbg_event;
@@ -117,7 +124,9 @@ HexOutput Hex_Update(HexState *h,
                      uint8_t center,
                      uint8_t right,
                      uint8_t left,
-                     uint16_t mask);
+                     uint16_t mask,
+                     uint8_t gyro_ok,     /* [原地转] 陀螺可用 */
+                     float gyro_z);       /* [原地转] 角速度 °/s */
 void Hex_GetDebug(const HexState *h, HexDebug *d);
 
 #endif /* SPECIAL_H */

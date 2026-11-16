@@ -372,7 +372,7 @@ int main(void)
         ControlDebug d;
         dbg_last = HAL_GetTick();
         Control_GetDebug(&d);
-        printf("%d,%d,%d,%d,%d,%d,%d,%d\r\n",
+       printf("%d,%d,%d,%d,%d,%d,%d,%d\r\n",
                (int)TIM1->CCR1, (int)TIM1->CCR2,
                (int)(d.target_L * 10.0f), (int)(d.target_R * 10.0f),
                (int)d.dL, (int)d.dR,
@@ -387,7 +387,7 @@ int main(void)
       if ((HAL_GetTick() - yaw_last) >= 100U)
       {
         yaw_last = HAL_GetTick();
-        printf("YAW,%d\r\n", (int)(Gyro_GetYaw() * 10.0f));
+        //printf("YAW,%d\r\n", (int)(Gyro_GetYaw() * 10.0f));
       }
     }
 
@@ -418,10 +418,12 @@ int main(void)
         HexDebug hd;
         Control_GetHexDebug(&hd);
 
-        printf("HEXSTAT,%d,%d,%d,%d,%d,%d,%lu,%d\r\n",
+        /* [HEX-V 2026-11-15] 末尾追加 mask：12 路原始掩码，用来复盘 V 型判据
+           （追加在最后，前面 8 列位置不变，旧解析脚本不受影响） */
+        printf("HEXSTAT,%d,%d,%d,%d,%d,%d,%lu,%d,%d\r\n",
                (int)hd.event_cnt, (int)hd.off_r, (int)hd.off_l,
                (int)hd.right, (int)hd.left, (int)hd.center,
-               (unsigned long)hd.dist, (int)hd.arm);
+               (unsigned long)hd.dist, (int)hd.arm, (int)hd.mask);
       }
     }
 		

@@ -15,27 +15,47 @@
 #define INTEG_LIMIT             30000.0f
 
 /* ---- 直道 / 方向环 ---- */
-#define BASE_SPEED              70.0f     /* 脉冲/10 ms（2026-11-14：100 -> 70） */
-#define TURN_MAX                25.0f
+#define BASE_SPEED              120.0f    /* [SPEED 2026-11-16] 70 -> 120（≈27 cm/s）。
+                                             提速试验：直道目标 27 cm/s，弯道仍由 pivot 处理。
+                                             注意：120 时方向环满舵(52)的最小半径约 14 cm，
+                                             六边形 60° 折角可能偏大，先看表现。 */
+#define TURN_MAX                55.0f     /* [TURN 2026-11-15] 25 -> 55。
+                                            turn=25 时两轮 45/95、ω 只有 41°/s、最小半径 22 cm，
+                                            60° 折角根本拐不过来。55 时两轮 15/125、ω≈91°/s、半径≈10 cm，
+                                            内轮还有余量、不会停转打滑。上限是 70（内轮=0），
+                                            再大内轮要反转，变成打滑原地转。 */
 #define CURVE_SLOW              0.0f//0.5f
 #define MIN_CURVE_SPEED         0.0f//20.0f
-#define DIR_QUAD                0.21f
+#define DIR_QUAD                1.0f     /* [TURN 2026-11-15] 0.21 -> 1.0。
+                                             原来 e=5.5 时 turn 只有 20.1，方向环永远打不满；
+                                             现在 e=5.5 时 = Kp×5.5 + 1.0×30.25 ≈ 52（接近 TURN_MAX） */
+#define DIR_KP                  4.0f     /* [TURN 2026-11-15] 方向环比例增益（原来写死在 motor.c，2.5） */
+#define DIR_DAMP                0.25f    /* [DAMP 2026-11-16] 陀螺阻尼：turn -= DIR_DAMP × gyro_z。
+                                             车转 100°/s 时收回 25，抑制中心附近的来回摆。
+                                             过大会"转不动"，建议 0.15~0.30 */
+#define TURN_SLEW               5.0f     /* [SLEW 2026-11-16] 转向命令每拍最大变化量。
+                                             正常进弯天然约 1.7/拍，不会介入；
+                                             只在误差突然翻符号时削掉阶跃（52→-52 要 21 拍） */
 
 /* ---- 通用过弯锁存 ----
    [GND 2026-11-15] 135°(航向变45°) 也会压到 4 路宽线，和 90° 在这一刻无法区分，
    所以阈值提到“方向环接近饱和”的位置：只有真拐不过去才锁存。 */
 #define CORNER_ENTER_ERR        4.5f     /* 3.0 -> 4.5：线到阵列边缘才算 */
-#define CORNER_ENTER_TURN       18.0f    /* 8 -> 18：turn≈18 对应 error≈5，方向环已接近满舵 */
+#define CORNER_ENTER_TURN       40.0f    /* [TURN 2026-11-15] 18 -> 40：TURN_MAX 提到 55 后，
+                                            阈值要同比提高，否则普通弯道稍一偏就触发过弯。
+                                            turn≈40 对应 error≈8，即方向环已经打到七成以上 */
 /* [GND 2026-11-14] 缓弯 vs 直角弯的区分：
    触发那一刻两者的 error/turn 完全一样，区别在“变化速度”——
    直角弯的线是几拍内跳到边缘，缓弯是慢慢漂。 */
 #define CORNER_ENTER_RATE       0.15f    /* 已不参与锁存判据（derr 会被自身打舵触发），保留供参考 */
 #define CORNER_ENTER_CNT        5U       /* 4 -> 5：45° 折角一般只压 3~4 路，直角弯口才到 5 路以上 */
-#define CORNER_ARM_TICKS        30U      /* [ARM 2026-11-15] 10 -> 30（0.3 s）。10 拍太短：
-                                            出弯后车头摆动时误差会短暂跌破阈值，一抖动就重新武装，
-                                            紧接着又锁存 -> 连转两次 90°，现场就是"180°"。 */
-#define CORNER_ARM_ERR          2.0f     /* [ARM 2026-11-15] 重新武装要求误差连续低于 2.0（比锁存阈值 4.5 紧得多），
-                                            确保"线真的回到中间"才允许下一次锁存 */
+#define CORNER_ARM_TICKS        15U      /* [FIX 2026-11-16] 30 -> 15（0.15 s）。
+                                            实测 120正方形第二角失败：过完第一个弯后车一直有偏置，
+                                            误差压不到 2.0 以下满 0.3 s -> 永不武装 -> 第二个弯全被挡住。
+                                            缩短时间窗，但阈值同时放宽（见下）。 */
+#define CORNER_ARM_ERR          3.0f     /* [FIX 2026-11-16] 2.0 -> 3.0。
+                                            0.15 s 内误差低于 3.0 就算"回到线附近"，避免短直道上
+                                            "永远等不到重新武装"。仍比锁存阈值 4.5 紧，不会来回连转。 */
 
 /* ---- 直角弯专职检测（[CW 2026-11-15]） ----
    指纹：一侧连续全亮（压到弯口）→ 紧接连续全黑（线甩出阵列）。
@@ -78,6 +98,9 @@
 #define CORNER_SETTLE_TOL       1.5f     /* 到位容差，° */
 #define CORNER_SETTLE_RATE      20.0f    /* |角速度| 低于此值算“已停住”，°/s */
 #define CORNER_SETTLE_MAX_TICKS 30U      /* 收尾最多 300 ms，超时放弃 */
+#define CORNER_RECOVER_DEG      30.0f    /* [RECOVER 2026-11-16] 转完 90° 仍丢线时，
+                                            反方向原地找线的最大角度，° */
+#define CORNER_RECOVER_TICKS    80U      /* 找线最多 800 ms（40° 左右，兜底） */
 #define CORNER_SETTLE_MAG       30.0f    /* 收尾用的差速（比 PIVOT_TARGET 小，动作更细） */
 #define CORNER_SETTLE_COAST_RATE 35.0f   /* [JUDDER 2026-11-15] |角速度| 还高于此值就先断电滑行：
                                             在高速旋转时通电修正 = 反接制动，电流数倍 -> 抖动 */
@@ -89,21 +112,50 @@
    车会一直偏到 error>3 才猛打一次。这里单独给“差速”一个增益。 */
 #define DIR_DIFF_GAIN           10.0f    /* 每单位 turn 额外的占空比差 */
 
-/* ---- 六边形入口 ----
-   [HEX 2026-11-15] 总开关。置 0 = 只更新调试快照，不产生事件、不覆盖舵量。
-   原因：直角弯时 ch11 与 ch5/ch6 会同时亮，满足“第一次事件”的判据，
-   5 秒内的下一个弯又满足“第二次事件”，会把过弯逻辑打断。
-   先保证直角弯稳定；等六边形段真的要用时，再把这里改回 1 并重做判据。 */
-#define HEX_ENABLE              0
+/* ---- 六边形入口（[HEX 2026-11-15] 整理） ----
+   HEX_MODE 三档：
+     0 = 关闭：只更新调试快照，不产生事件、不接管（当前默认）
+     1 = 只记录：照常产生事件并打印 HEX 行，但**不接管舵量**——用来在真实赛道上
+         验证"六边形顶点"和"直角弯"的波形差异，确认不误触发后再切 2
+     2 = 接管：事件确认后按 HEX_V_MAX_TICKS 拍打舵覆盖
+   注意：判据里的 ch11/ch0 + center 在直角弯上同样成立，所以 1 档是必要的验证步骤。 */
+#define HEX_MODE                2
 #define COUNTS_PER_CM           435.7f
-#define HEX_CLEAR_CM            0.0f
-#define HEX_CLEAR_COUNTS        ((uint32_t)(COUNTS_PER_CM * HEX_CLEAR_CM))
-#define HEX_OFF_TICKS           1U
-#define HEX_PRE_TURN_TICKS      20U
-#define HEX_PRE_TURN            16.0f
-#define HEX_PRE_SPEED           20.0f
-#define HEX_TURN_TICKS          15U
-#define HEX_ARM_TIMEOUT         500U
+
+/* ---- 六边形入口：V 型判据（[HEX-V 2026-11-15]） ----
+   通道分组：a = ch0,1 / ch10,11（两端）
+             b = ch2,3,4 / ch7,8,9（两中段，**三路全亮才算 b 存在**；任意一路暗即 !b）
+             c = ch5 & ch6（正中）
+   一次 V = 某侧 a 亮 && c 亮 && 同侧 b 不完整（中间有缺口）。
+   [实测 2026-11-15 手推] 六边形**每个顶点只产生一次 V**，相邻顶点 10~16 cm，
+   不存在"两次 V 相隔 2 cm"——所以按单次 V 直接触发。
+   直角弯由过弯状态机优先处理（hex 覆盖本来就被 !Corner_IsActive 挡住）。 */
+#define HEX_V_TURN              25.0f    /* 触发后的打舵量（旧"边走边转"方案，保留备用） */
+#define HEX_V_SPEED             25.0f    /* 旧方案的速度目标（保留备用） */
+#define HEX_V_PIVOT_TURN        45.0f    /* [原地转方案] 两轮等幅反向的差速 */
+#define HEX_V_DEG               30.0f    /* [原地转方案] 目标转角，°，用陀螺闭环 */
+#define HEX_V_DEG_TOL           4.0f     /* 角度容差，° */
+#define HEX_V_MAX_TICKS         60U      /* 原地转最多 600 ms（兜底） */
+#define HEX_V_MIN_TICKS         8U       /* 至少 8 拍才允许判"摸到线"（防触发那一拍立刻结束） */
+#define HEX_V_GAP_MIN_CM        10.0f    /* [纯距离触发] 武装后走这么远就开始原地转。
+                                            实测：手推 10.3 cm、自跑 10.2 cm，间距非常稳定。
+                                            不用 c/b 判据——实测 9 cm 之后 c 必灭，判据自相矛盾 */
+#define HEX_V_GAP_MAX_CM        16.0f    /* 兜底：超过这个距离还没触发就解除武装 */
+#define HEX_V_GAP_MIN_COUNTS    ((uint32_t)(HEX_V_GAP_MIN_CM * COUNTS_PER_CM))
+#define HEX_V_GAP_MAX_COUNTS    ((uint32_t)(HEX_V_GAP_MAX_CM * COUNTS_PER_CM))
+#define HEX_V_B_MAX             1U       /* [FIX 2026-11-16] b 段最多亮几路才算"缺口"。
+                                            2 -> 1：b 只有 3 路，亮 2 路意味着只暗 1 路——
+                                            单路漏读就能伪造一个 V（实测 直角-六边耦合1：
+                                            mask=117=ch0,2,4,5,6，ch1/ch3 漏读，被当成缺口）。
+                                            改成 1 后要至少暗 2 路才算缺口。 */
+
+/* ---- 六边形区间（[HEX-ZONE 2026-11-15]） ----
+   [实测] 六边形**内部 6 个顶点不产生 V**（60° 折角线是连着的，不出现"端点亮+正中亮+中间缺口"）；
+   V 只在**入口**和**出口**出现。所以区间不能靠"见到 V 续命"，必须一次覆盖整圈。
+   六边形一圈约 120 cm，取 150 cm（含余量）。
+   区间内**禁用直角弯检测**（CW + 通用锁存），否则六边形内部的宽线会被当成直角弯。 */
+#define HEX_ZONE_CM             150.0f
+#define HEX_ZONE_COUNTS         ((uint32_t)(HEX_ZONE_CM * COUNTS_PER_CM))
 
 /* ---- 过弯四段式：冲弯 -> 刹停 -> 原地转（[APPROACH 2026-11-14] 新增） ----
    CORNER_APPROACH_CM 是“从检测到弯 -> 车停稳”的总位移。
@@ -136,10 +188,10 @@
 #define CORNER_BRAKE_STEP       5.0f     /* 减速度：每拍掉 5 counts/10ms */
 #define CORNER_BRAKE_COUNTS     ((uint32_t)((CORNER_APPROACH_SPEED * CORNER_APPROACH_SPEED) / (2.0f * CORNER_BRAKE_STEP)))
 #define CORNER_BRAKE_STOP       3.0f     /* |实测速度| < 此值算停稳 */
-#define CORNER_STOP_ZONE        50U      /* [STOP 2026-11-15] 到位判据：剩余 <= 50 counts(≈1.1 mm)
-                                            且速度已低即算停稳。原来要求 remain==0——
-                                            但减速曲线是“按距离线性、渐近逼近”，永远到不了 0，
-                                            结果每次都要等满 BRAKE_MAX(600 ms) 才进 pivot。 */
+#define CORNER_STOP_ZONE        150U     /* [FIX 2026-11-16] 50 -> 150（≈3.4 mm）。
+                                            实测 120正方形第二角失败：刹车段速度已经到 0，
+                                            但 remain 还 >50，只能等 BRAKE_MAX(0.6 s) 超时。
+                                            放宽到 3.4 mm 能让刹车段提前 0.4~0.5 s 结束。 */
 #define CORNER_BRAKE_MAX        60U      /* 600 ms 兜底 */
 #define CORNER_SETTLE_TICKS     3U       /* 停稳后再等 30 ms 才转 */
 
@@ -167,10 +219,13 @@
    [FF 2026-11-14] 前馈按工况拆成两套。
    实测：直道自由滚动 k≈0.60，原地转（两轮互顶+横刮）k≈0.081，负载差 7 倍。
    一套线性前馈不可能同时对上——原来 14.5 在 pivot 正好，在直道超速 4 倍。 */
-#define FF_DRIVE_L              3.2f     /* 直道：target 70 时约占空比 224 */
-#define FF_DRIVE_R              3.4f
-#define FF_DRIVE_L_REV          3.6f
-#define FF_DRIVE_R_REV          3.8f
+#define FF_DRIVE_L              2.27f    /* [SPEED 2026-11-16] BASE 70->120 重标定。
+                                             由实测两点 (target70,CCR≈220)、(target35,CCR≈150) 拟合：
+                                             CCR ≈ 134 + 1.148×speed  =>  target 120 需要 CCR≈272
+                                             272/120 = 2.27。原来的 3.2 在 120 时会给 384，严重过驱 */
+#define FF_DRIVE_R              2.41f    /* 右轮略弱，按原比例 3.4/3.2 折算 */
+#define FF_DRIVE_L_REV          2.55f
+#define FF_DRIVE_R_REV          2.71f
 
 #define FF_PIVOT_L              14.5f    /* 原地转：沿用原标定 */
 #define FF_PIVOT_R              15.4f
@@ -210,8 +265,12 @@
 #define STALL_RETRIES           3U
 
 /* ---- 丢线 / 编码器保护 ---- */
-#define LOST_STOP_TICKS         80U      /* [BASE 70] 150->80：BASE 70 下 0.8 s ≈ 13 cm，原来 150 拍要冲 24 cm */
-#define ENC_DELTA_LIMIT         300
+#define LOST_STOP_TICKS         50U      /* [FIX 2026-11-16] 80 -> 50（0.5 s）。
+                                            实测丢线后要 1.4 s 才停（中间有线闪回把计数清了）；
+                                            0.5 s 在 BASE 120 下约 13 cm，够短。 */
+#define ENC_DELTA_LIMIT         500      /* [SPEED 2026-11-16] 300 -> 500：BASE 120 时正常拍
+                                             增量就到 120，加速/弯道峰值可能到 200+，
+                                             300 太紧会误杀真数据 */
 
 /* ---- 低速增益调度 ---- */
 #define KP_LOW_SPEED            10.0f

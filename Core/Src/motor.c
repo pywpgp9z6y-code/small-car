@@ -6,7 +6,7 @@ PID_t pid_L = { .Kp = SPEED_KP_DEFAULT, .Ki = SPEED_KI_DEFAULT, .Kd = 0.0f };
 PID_t pid_R = { .Kp = SPEED_KP_DEFAULT, .Ki = SPEED_KI_DEFAULT, .Kd = 0.0f };
 
 /* 方向环 */
-DirPID_t dir_pid = { .Kp = 2.5f, .Ki = 0.0f, .target = 0.0f };
+DirPID_t dir_pid = { .Kp = DIR_KP, .Ki = 0.0f, .target = 0.0f };
 
 /* [BRAKE 2026-11-15] 死区补偿开关，默认开；刹车段由 special.c 关掉 */
 static uint8_t motor_boost_en = 1U;
