@@ -17,6 +17,7 @@
  * 见工程根目录 CONTROL_NOTES.md。
  */
 #include "main.h"
+#include <stdio.h>          /* [BLIND] printf 诊断 */
 #include "control.h"
 #include "car_config.h"
 #include "car_state.h"
@@ -35,6 +36,16 @@ static CornerState corner;
 static HexState hex;
 static uint8_t hex_pivot_active;   /* [原地转] 六边形入口正在原地转 */
 static float   turn_prev;          /* [SLEW 2026-11-16] 上一拍的转向命令 */
+static float   err_f;              /* [KINEMA 2026-11-18] 低通后的误差（单位：路） */
+static float   err_prev;           /* [KINEMA 2026-11-18] 上一拍滤波后的误差（算微分） */
+
+/* [BLIND 2026-11-18] 断线区斜穿状态 */
+static uint8_t  blind_phase;       /* 0=关 1=转向到目标角 2=保持航向直行 */
+static float    blind_dir;         /* +1 / -1 */
+static float    blind_yaw;         /* 已转过的角度，° */
+static uint32_t blind_dist;        /* 已走过的 counts */
+static uint8_t  blind_seen;        /* 连续看到线的拍数（退出用迟滞） */
+static uint16_t blind_tick;        /* 本阶段计时（超时兜底） */
 
 /* ---- 编码器 ---- */
 static int16_t last_L = 0, last_R = 0;
@@ -74,6 +85,11 @@ static void Car_Stop(void)
     Corner_Reset(&corner);
     Hex_Reset(&hex);
     turn_prev = 0.0f;      /* [SLEW 2026-11-16] 停车后清掉斜率基准 */
+    err_f     = 0.0f;      /* [KINEMA 2026-11-18] 清掉误差滤波状态 */
+    err_prev  = 0.0f;
+    blind_phase = 0U;      /* [BLIND 2026-11-18] */
+    blind_yaw   = 0.0f;
+    blind_dist  = 0U;
 
     car.spin.mode = 0U;
     car.spin.yaw = 0.0f;
@@ -274,31 +290,70 @@ static uint8_t Control_Direction(void)
     /* 1) 12 路 -> 偏差 */
     Sensor_Scan(&line);
 
-    /* 2) 方向环 PID + 二次项，先算出来交给 special 决定是否锁存 */
+    /* 2) 方向环：先算出来交给 special 决定是否锁存 */
     if (line.cnt > 0U)//T:没丢线才上方向环？
     {
+#if (DIR_MODE == 1)
+        /* [KINEMA 2026-11-18] 运动学映射：误差 → 曲率 → 角速度 → 差速
+           κ = 2e/d²，ω = v·κ，turn = ω/(2·v/L)  =>  turn = 13.3·v·e/d²
+           只有一个参数：前视距离 d。天然满足 turn < v（内轮不反转）。 */
+        {
+            float v;
+            float d;
+            float turn_ff;
+            float omega_des;
+            float err_d;
+
+            err_f += ERR_FILTER_ALPHA * (line.error - err_f);   /* 量化低通 */
+
+            /* [KINEMA 2026-11-18] 微分项（阻尼）：纯 P 律在横向动力学上是
+               无阻尼振荡器（ė = v·ψ, ψ̇ = ω, ω = -G·e  =>  ë = -v·G·e），
+               必须用 Δe（≈车头角）提供阻尼，否则直道会一直抖。 */
+            {
+                float de = err_f - err_prev;
+                err_prev = err_f;
+                err_d    = err_f + KINEMA_TD * de;
+            }
+
+            v = car.speed_cmd;                  /* 上一拍的速度目标，够用 */
+            if (v < 30.0f) v = 30.0f;           /* 防止低速时映射爆炸 */
+
+            d = (Hex_ZoneActive() != 0U) ? PURSUIT_L_CM_HEX : PURSUIT_L_CM;
+
+            /* [KINEMA 2026-11-18] 符号约定：error = bias - 5.5，error>0 表示线在右侧，
+               车应该右转（turn < 0）。所以这里必须带负号——漏掉负号会变成正反馈，
+               车会越偏越往外打舵、直接乱转（新方案错误1 就是这个）。 */
+            turn_ff   = -CURVE_K * v * err_d / (d * d);  /* 期望差速（含微分阻尼） */
+            omega_des = turn_ff * OMEGA_PER_TURN;        /* 期望角速度 °/s（右转为负） */
+
+            /* [ARC 2026-11-18] 纯阻尼：只做速率反馈，不再用 K·(ω_des−ω)。
+               原来那形式里 +K·ω_des 与 turn_ff 同号，会把位置增益从 16 放大到 29，
+               正是直道高速抖动的来源。 */
+            pid_turn = turn_ff - DAMP_K * Gyro_GetZ();
+        }
+#else
         pid_turn = DirPID_Calc(&dir_pid, line.error);
         pid_turn += DIR_QUAD * (-line.error) * ((line.error >= 0.0f) ? line.error : -line.error);
 
-        /* [DAMP 2026-11-16] 陀螺阻尼：车转得越快越"收油"。
-           方向环原来是纯比例+二次项，没有阻尼，误差在中心附近来回摆 ->
-           转向命令在 +52/-52 之间瞬间翻转，电机受冲击、观感是"摆一下"。
-           gyro_z: °/s，左转为正；turn 左转为正，所以是减。 */
+        /* [TURNBIAS 2026-11-18] 六边形区间内把转向增益放大，让内轮能降到 0 */
+        if (Hex_ZoneActive() != 0U)
+            pid_turn *= TURN_GAIN_BOOST;
+
+        /* [DAMP 2026-11-16] 陀螺阻尼：车转得越快越"收油" */
         pid_turn -= DIR_DAMP * Gyro_GetZ();
+#endif
 
         if (pid_turn >  TURN_MAX) pid_turn =  TURN_MAX;
         if (pid_turn < -TURN_MAX) pid_turn = -TURN_MAX;
 
-        /* [SLEW 2026-11-16] 转向限斜率：每拍最多变 TURN_SLEW。
-           正常进弯 turn 的天然变化率约 1.7/拍（误差 0->5.5 用 30 拍），
-           5/拍 的限幅根本不会介入；只在"误差突然翻符号"时削掉阶跃。 */
+        /* [SLEW 2026-11-16] 转向限斜率：每拍最多变 TURN_SLEW，削掉阶跃 */
         if (pid_turn > turn_prev + TURN_SLEW) pid_turn = turn_prev + TURN_SLEW;
         if (pid_turn < turn_prev - TURN_SLEW) pid_turn = turn_prev - TURN_SLEW;
         turn_prev = pid_turn;
     }
 
-    /* 3) 丢线保护：过弯锁存期间不因线暂时消失而停 */
-    if (line.cnt == 0U && !Corner_IsActive(&corner))//丢线且不处于过弯态
+    /* 3) 丢线保护：过弯锁存期间/斜穿期间不因线暂时消失而停 */
+    if (line.cnt == 0U && !Corner_IsActive(&corner) && (blind_phase == 0U))//丢线且不处于过弯态
     {
         if (++car.lost_cnt >= LOST_STOP_TICKS)
         {
@@ -346,7 +401,7 @@ static uint8_t Control_Direction(void)
        否则冲弯/刹车会被 15 拍的满舵覆盖打断。
        [CW 2026-11-15] 出弯冷却期内也不许抢：pivot 刚停的那一拍
        Corner_IsActive 已经变假，hex 会立刻把舵拉到 ±25，看起来像"又转了一下"。 */
-    if (hex_out.have_control && !Corner_IsActive(&corner) && (corner.cooldown == 0U))
+    if (hex_out.have_control && !Corner_IsActive(&corner) && (Corner_IsCooling(&corner) == 0U))
     {
         turn = hex_out.turn;
         car.speed_cmd = hex_out.speed_cmd;
@@ -356,9 +411,92 @@ static uint8_t Control_Direction(void)
         hex_pivot_active = (hex_out.speed_cmd == 0.0f) ? 1U : 0U;
     }
 
+    /* [BLIND 2026-11-18] 断线区斜穿：不是直角弯、不是六边形时的丢线兜底。
+       转向到 tan=24/65（20.3°）-> 保持航向直行 √(24²+65²)=69.3 cm，
+       期间一旦看到线立刻交回方向环。 */
+    if ((Corner_IsActive(&corner) == 0U) && (Hex_ZoneActive() == 0U))
+    {
+        if (blind_phase == 0U)
+        {
+            if ((line.cnt == 0U) && (car.lost_cnt >= BLIND_START_TICKS))
+            {
+                blind_phase = 1U;
+                blind_dir   = BLIND_DIR_FIXED;   /* [BLIND] 方向固定，不看丢线前的误差 */
+                blind_yaw   = 0.0f;
+                blind_dist  = 0U;
+                blind_seen  = 0U;
+                blind_tick  = 0U;
+                printf("BLD,1,%d,%d,%d\r\n", (int)car.lost_cnt, (int)blind_dir, (int)(err_f * 10.0f));
+            }
+        }
+        else
+        {
+            float ya;
+
+            /* [FIX 2026-11-18] 退出要连续 BLIND_SEEN_TICKS 拍看到线。
+               原来 1 拍就退出，断线区边缘闪一下 -> 整个状态重置 -> 角度归零
+               -> 再启动再归零，永远转不到目标角。 */
+            if (line.cnt > 0U)
+            {
+                if (blind_seen < 250U) ++blind_seen;
+            }
+            else
+            {
+                blind_seen = 0U;
+            }
+
+            if (blind_seen >= BLIND_SEEN_TICKS)
+            {
+                blind_phase = 0U;                               /* 真的找到线了，交回 */
+            }
+            else
+            {
+                if (Gyro_IsOk())
+                    blind_yaw += Gyro_GetZ() * 0.01f;
+
+                blind_dist += (uint32_t)(((dbg_speed_L < 0.0f ? -dbg_speed_L : dbg_speed_L) +
+                                          (dbg_speed_R < 0.0f ? -dbg_speed_R : dbg_speed_R)) * 0.5f);
+                ++blind_tick;
+
+                if (blind_phase == 1U)
+                {
+                    turn          = blind_dir * BLIND_TURN;
+                    car.speed_cmd = BLIND_TURN_SPEED;
+
+                    ya = (blind_yaw >= 0.0f) ? blind_yaw : -blind_yaw;
+                    if ((ya >= BLIND_ANGLE_DEG) || (blind_tick >= BLIND_TURN_MAX_TICKS))
+                    {
+                        blind_phase = 2U;                       /* 角度到 / 超时 -> 转直行 */
+                        blind_tick  = 0U;
+                    }
+                }
+                else
+                {
+                    float e = (blind_dir * BLIND_ANGLE_DEG) - blind_yaw;
+
+                    turn          = BLIND_K_YAW * e;
+                    car.speed_cmd = BLIND_SPEED;
+
+                    if ((blind_dist >= BLIND_DIST_COUNTS) || (blind_tick >= BLIND_RUN_MAX_TICKS))
+                        blind_phase = 0U;                       /* 走完还没找到：放弃，交给丢线停车 */
+                }
+                have_control = 1U;
+            }
+        }
+    }
+
     /* 5) 差速 -> 左右目标速度（过弯/正常统一在这里写） */
     if (have_control)
-    {
+    {        /* [NOSPIN 2026-11-18] 不反转护栏：巡线/六边形弧线阶段，turn 不允许超过
+           speed_cmd，否则内轮目标为负 -> 电机反接制动（电流数倍、驱动易烧）。
+           pivot/原地转走的是另一条路（target 允许为负），所以这里要排除。 */
+        if ((!corner_was_active) && (!Corner_IsActive(&corner)) &&
+            (car.spin.mode == 0U) && (hex_pivot_active == 0U))
+        {
+            if (turn >  car.speed_cmd) turn =  car.speed_cmd;
+            if (turn < -car.speed_cmd) turn = -car.speed_cmd;
+        }
+
         pid_L.target = car.speed_cmd - turn;
         pid_R.target = car.speed_cmd + turn;
 
@@ -368,10 +506,39 @@ static uint8_t Control_Direction(void)
         if (pid_L.target < -TARGET_MAX) pid_L.target = -TARGET_MAX;
         if (pid_R.target >  TARGET_MAX) pid_R.target =  TARGET_MAX;
         if (pid_R.target < -TARGET_MAX) pid_R.target = -TARGET_MAX;
+
+        /* [BRAKE 2026-11-18] 弧线起步反向脉冲：
+           EN=0 是滑行，内轮从 120 掉到 0 要 0.27 s（车前进 7 cm 才开始转）。
+           这里给内轮一个短促反接，把它压到 ~0.06 s。
+           [PIVOT-C] 方案 C 的内轮本来就在反转（25−120=−95），不再需要这个脉冲。 */
+#if (ARC_BRAKE_ENABLE == 1)
+        if ((corner.state == CORNER_ST_ARC) && (corner.arc_ticks <= ARC_BRAKE_TICKS))
+        {
+            if (turn > 0.0f)                 /* 左转：内轮是左轮 */
+            {
+                if (dbg_speed_L > ARC_BRAKE_SPEED_MIN)
+                    pid_L.target = ARC_BRAKE_TARGET;
+            }
+            else if (turn < 0.0f)            /* 右转：内轮是右轮 */
+            {
+                if (dbg_speed_R > ARC_BRAKE_SPEED_MIN)
+                    pid_R.target = ARC_BRAKE_TARGET;
+            }
+        }
+#endif
 				if (!corner_was_active && !Corner_IsActive(&corner)) {   /* [PIVOT 2026-11-14] 锁存期允许一侧目标为负（两轮反向） */
         if (pid_L.target < 0.0f) pid_L.target = 0.0f;
         if (pid_R.target < 0.0f) pid_R.target = 0.0f;
 			}
+    }
+    else
+    {
+        /* [FIX 2026-11-18] 没有控制权（丢线 + 不在过弯/六边形/斜穿里）时，
+           必须把目标清零。原来这一块整个跳过 -> 目标保持上一次的值，
+           双六边形1 的最后一段就是：六边形转完、线丢了，目标冻在 0/450，
+           车原地打转 0.4 s 才被斜穿接管，直接转出赛道。 */
+        pid_L.target = 0.0f;
+        pid_R.target = 0.0f;
     }
 
     return 0U;
@@ -546,8 +713,15 @@ static uint8_t Control_Speed(void)
                 if (!FF_IsPivotMode())
                 {
                     float dtrn = (pid_R.target - pid_L.target) * 0.5f;
-                    ff_l -= DIR_DIFF_GAIN * dtrn;
-                    ff_r += DIR_DIFF_GAIN * dtrn;
+                    float dff  = DIR_DIFF_GAIN * dtrn;
+
+                    /* [FIX 2026-11-18] 钳位：turn 到 120 时 10×120=1200 会把外轮
+                       打到 CCR 1745、内轮断电，并造成积分饱和式超调。 */
+                    if (dff >  DIR_DIFF_MAX) dff =  DIR_DIFF_MAX;
+                    if (dff < -DIR_DIFF_MAX) dff = -DIR_DIFF_MAX;
+
+                    ff_l -= dff;
+                    ff_r += dff;
                 }
 
                 Motor_Output(ff_l + PID_Calc(&pid_L, speed_L),

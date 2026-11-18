@@ -15,21 +15,99 @@
 #define INTEG_LIMIT             30000.0f
 
 /* ---- 直道 / 方向环 ---- */
-#define BASE_SPEED              120.0f    /* [SPEED 2026-11-16] 70 -> 120（≈27 cm/s）。
+#define BASE_SPEED              150.0f    /* [SPEED 2026-11-16] 70 -> 120（≈27 cm/s）。
                                              提速试验：直道目标 27 cm/s，弯道仍由 pivot 处理。
                                              注意：120 时方向环满舵(52)的最小半径约 14 cm，
                                              六边形 60° 折角可能偏大，先看表现。 */
-#define TURN_MAX                55.0f     /* [TURN 2026-11-15] 25 -> 55。
-                                            turn=25 时两轮 45/95、ω 只有 41°/s、最小半径 22 cm，
-                                            60° 折角根本拐不过来。55 时两轮 15/125、ω≈91°/s、半径≈10 cm，
-                                            内轮还有余量、不会停转打滑。上限是 70（内轮=0），
-                                            再大内轮要反转，变成打滑原地转。 */
+#define TURN_MAX                120.0f    /* [TURNBIAS 2026-11-18] 55 -> 120（= BASE_SPEED）。
+                                            内轮可以降到 0（不反转），此时：
+                                              ω = 2×120 counts/10ms ÷ 16 cm = 194°/s
+                                              R = 27 cm/s ÷ 3.38 rad/s = 8 cm
+                                            这就是"不反转"能给的极限半径，覆盖六边形 60° 折角。
+                                            注意：只是上限放开，实际会不会打满由下面的增益决定。 */
+#define TURN_GAIN_BOOST         2.3f      /* [TURNBIAS 2026-11-18] 六边形区间内的增益倍率。
+                                            平时 e=5.5 的 turn 上限是 52（不打扰直道）；
+                                            区间内 ×2.3 -> 约 120，正好用满内轮=0 的能力。 */
+
 #define CURVE_SLOW              0.0f//0.5f
 #define MIN_CURVE_SPEED         0.0f//20.0f
 #define DIR_QUAD                1.0f     /* [TURN 2026-11-15] 0.21 -> 1.0。
                                              原来 e=5.5 时 turn 只有 20.1，方向环永远打不满；
                                              现在 e=5.5 时 = Kp×5.5 + 1.0×30.25 ≈ 52（接近 TURN_MAX） */
 #define DIR_KP                  4.0f     /* [TURN 2026-11-15] 方向环比例增益（原来写死在 motor.c，2.5） */
+
+/* ---- 方向环模式（[KINEMA 2026-11-18]） ----
+   0 = 旧方案：Kp·e + QUAD·e²（需要试凑三个增益）
+   1 = 运动学映射：误差 → 曲率 → 角速度 → 差速（只有一个参数：前视距离） */
+#define DIR_MODE                1
+#define PURSUIT_L_CM            10.0f    /* [CENTER 2026-11-18] 12 -> 10：回中太慢导致连续弯漂移。
+                                            增益 11 -> 16。直道抖动已由 DIR_DIFF_MAX 钳位解决，
+                                            不再需要靠砍增益来压。 */
+#define PURSUIT_L_CM_HEX        7.5f     /* 六边形区间内用更短的前视（更激进）：
+                                            turn = 13.3·120·5.5/56 ≈ 157 -> 钳到 120（R=8 cm） */
+#define ERR_FILTER_ALPHA        0.30f    /* [CENTER 2026-11-18] 0.25 -> 0.30：折中，
+                                            0.25 的延迟让回中更慢 */
+#define OMEGA_KP                0.5f     /* 角速度环增益：turn / (°/s) */
+#define OMEGA_PER_TURN          1.644f   /* 1 单位 turn 对应的角速度，°/s（纯几何） */
+#define CURVE_K                 13.3f    /* turn = CURVE_K · v · e / d²（v 用 counts/10ms） */
+#define DAMP_K                  0.4f     /* [ARC 2026-11-18] 巡线纯阻尼：turn -= DAMP_K·ω。
+                                            不再用 K·(ω_des−ω)，那会把位置增益放大 82%。 */
+
+/* ---- 直角弯模式（[ARC 2026-11-18]） ----
+   0 = 老的停车方案：APPROACH → BRAKE → PIVOT → SETTLE → RECOVER
+   1 = 带速度弧线：CW 看到宽线就触发，用陀螺双环把车转 90°，全程不停车 */
+#define CORNER_MODE             1
+#define ARC_WIDE_TICKS          3U       /* 宽线持续这么多拍就触发（不等全黑，提前 ~5 cm） */
+#define ARC_YAW_DEG             90.0f    /* 目标偏航角，° */
+#define ARC_YAW_TOL             2.0f     /* 角度容差，° */
+#define ARC_K_YAW               4.0f     /* 偏航外环：ω_des = K_YAW·(目标−当前)，1/s */
+#define ARC_OMEGA_MAX           220.0f   /* 期望角速度上限，°/s */
+#define ARC_K_OMEGA             0.3f     /* 偏航内环：turn = ω_des/1.644 + K·(ω_des−ω) */
+#define ARC_TURN_MAX            120.0f   /* 弧线时的转向上限 */
+#define ARC_CREEP_SPEED         50.0f    /* [PIVOT-C 2026-11-18] 25 -> 50：转弯太早。
+                                            25 时转弯期间只前进 2.6 cm，在弯口前就把 90° 转完了；
+                                            50 时前进 5.3 cm，正好"扫"到弯口。
+                                            顺带好处：内轮从 -95 变成 -70，反接电流更小。 */
+#define ARC_BRAKE_ENABLE        0        /* [PIVOT-C] 内轮已经在反转，不需要额外的反脉冲了 */
+#define DIR_DIFF_MAX            160.0f   /* [FIX 2026-11-18] 差速前馈的钳位。
+                                            DIR_DIFF_GAIN=10 是按 turn≤52 调的，
+                                            现在 turn 到 120 -> 10×120=1200，直接把外轮打到
+                                            CCR 1745、内轮 −1200 断电（新方案1 的"CCR 1000+"
+                                            和"两倍超调"都是它）。钳到 ±150 只保留它压死区的作用。 */
+#define ARC_MAX_TICKS           100U     /* 1 s 兜底 */
+
+/* ---- 断线区斜穿（[BLIND 2026-11-18]） ----
+   不是直角弯/六边形的场合丢线时，按固定角度斜穿过去找线：
+   tan = 15/65 -> 13.0°，路程 = √(15²+65²) = 66.7 cm。 */
+#define BLIND_ANGLE_DEG         13.0f
+#define BLIND_DIST_CM           66.7f
+#define BLIND_DIST_COUNTS       ((uint32_t)(BLIND_DIST_CM * COUNTS_PER_CM))
+#define BLIND_START_TICKS       5U       /* 丢线这么多拍后开始斜穿 */
+#define BLIND_SPEED             60.0f    /* 斜穿时的前进速度 */
+#define BLIND_TURN              45.0f    /* 转向阶段的差速（注意：不反转护栏会把 turn 钳到 ≤ speed，
+                                            所以这里必须 ≤ BLIND_TURN_SPEED） */
+#define BLIND_TURN_SPEED        45.0f    /* 转向阶段的前进速度（内轮 0，不反转） */
+#define BLIND_K_YAW             2.0f     /* 直行阶段的航向保持增益 */
+#define BLIND_DIR_FIXED        -1.0f     /* [BLIND 2026-11-18] 斜穿方向固定值：
+                                            +1 = 左转（turn 为正）
+                                            -1 = 右转（turn 为负）
+                                            不再看丢线前的误差——那个值不可靠。
+                                            现在固定右转。 */
+#define BLIND_SEEN_TICKS        3U       /* [FIX 2026-11-18] 连续这么多拍看到线才算"找到"。
+                                            原来 1 拍就退出，断线区边缘一闪就把角度归零，
+                                            导致永远转不到目标角。 */
+#define BLIND_TURN_MAX_TICKS    60U      /* 转向阶段超时（0.6 s），兜底强制进直行 */
+#define BLIND_RUN_MAX_TICKS     600U     /* 直行阶段超时（6 s），兜底放弃 */
+#define ARC_BRAKE_TICKS         5U       /* [BRAKE 2026-11-18] 弧线起步给内轮一个反向脉冲的拍数。
+                                            实测 EN=0 是滑行、没有电刹车，内轮从 120 掉到 0 要 0.27 s；
+                                            这 5 拍（50 ms）反接能把它压到 ~0.06 s。 */
+#define ARC_BRAKE_TARGET        -15.0f   /* 反脉冲的目标速度（只越过反向死区，不是全速反接） */
+#define ARC_BRAKE_SPEED_MIN     40.0f    /* 实测速度高于此值才反接（低速反接没意义还伤电机） */
+#define ARC_TRIG_ERR            3.5f     /* [ARC 2026-11-18] 圆弧触发还要求误差已接近极限。
+                                            只靠"宽线"会把缓弯、十字路口全当成直角弯
+                                            （方向环太强：mask=4095 全亮也触发过）。 */
+#define KINEMA_TD               0.5f     /* [CENTER 2026-11-18] 0.3 -> 0.5：增益拿回 16 后
+                                            需要更多阻尼，否则又会摆。 */
 #define DIR_DAMP                0.25f    /* [DAMP 2026-11-16] 陀螺阻尼：turn -= DIR_DAMP × gyro_z。
                                              车转 100°/s 时收回 25，抑制中心附近的来回摆。
                                              过大会"转不动"，建议 0.15~0.30 */
@@ -71,7 +149,12 @@
 #define CORNER_MIN_TICKS        12U      /* 120 ms（pivot 方案下已不使用） */
 #define CORNER_MAX_TICKS        200U     /* [GND 2026-11-14] 80->200：实测 ω≈57°/s，转 82° 要 144 拍；
                                             80 拍只够 46°——每次被超时掐断->再触发->反向再转 */
-#define CORNER_COOLDOWN         40U      /* 200->400 ms：pivot 后给车时间回中，避免立刻重复锁存 */
+#define CORNER_COOLDOWN         40U      /* 旧的时间制冷却（已不用，保留兼容） */
+#define CORNER_COOLDOWN_CM      6.0f     /* [COOLDOWN 2026-11-18] 出弯冷却改为距离制：
+                                            走过 6 cm 才允许下一次锁存。
+                                            时间制 0.4 s 在 BASE 120 下 = 11 cm，
+                                            比锯齿段的角间距（15~20 cm）还长，会漏弯。 */
+#define CORNER_COOLDOWN_COUNTS  ((uint32_t)(CORNER_COOLDOWN_CM * COUNTS_PER_CM))
 #define CORNER_RAMP_TICKS       15U      /* 150 ms */
 
 /* ---- 原地 pivot 过弯（[PIVOT 2026-11-14] 新增） ----
@@ -136,7 +219,11 @@
 #define HEX_V_DEG               30.0f    /* [原地转方案] 目标转角，°，用陀螺闭环 */
 #define HEX_V_DEG_TOL           4.0f     /* 角度容差，° */
 #define HEX_V_MAX_TICKS         60U      /* 原地转最多 600 ms（兜底） */
-#define HEX_V_MIN_TICKS         8U       /* 至少 8 拍才允许判"摸到线"（防触发那一拍立刻结束） */
+#define HEX_V_MIN_TICKS         35U      /* [FIX 2026-11-18] 8 -> 35（0.35 s）。
+                                            V 判据要求 c 亮，所以触发那一拍线就在中段；
+                                            8 拍时 touch 立刻成立，只转了 7° 就交回
+                                            （六边形问题：HEX,5 和 HEX,6 只隔一行）。
+                                            按 74°/s 算，转完 26° 需要 35 拍。 */
 #define HEX_V_GAP_MIN_CM        10.0f    /* [纯距离触发] 武装后走这么远就开始原地转。
                                             实测：手推 10.3 cm、自跑 10.2 cm，间距非常稳定。
                                             不用 c/b 判据——实测 9 cm 之后 c 必灭，判据自相矛盾 */
@@ -155,6 +242,8 @@
    六边形一圈约 120 cm，取 150 cm（含余量）。
    区间内**禁用直角弯检测**（CW + 通用锁存），否则六边形内部的宽线会被当成直角弯。 */
 #define HEX_ZONE_CM             150.0f
+#define HEX_HALF_DEG            180.0f   /* [DBLHEX 2026-11-18] 累计到 180°：不动作、归零重新累计 */
+#define HEX_FULL_DEG            180.0f   /* 第二段再累计 180°（总 360°）后，V 才允许出栈 */
 #define HEX_ZONE_COUNTS         ((uint32_t)(HEX_ZONE_CM * COUNTS_PER_CM))
 
 /* ---- 过弯四段式：冲弯 -> 刹停 -> 原地转（[APPROACH 2026-11-14] 新增） ----

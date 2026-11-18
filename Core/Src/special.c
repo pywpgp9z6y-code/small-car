@@ -29,6 +29,7 @@ void Corner_Reset(CornerState *c)
     c->yaw = 0.0f;
     c->ticks = 0U;
     c->cooldown = 0U;
+    c->cooldown_dist = 0U;  /* [COOLDOWN 2026-11-18] 距离制冷却 */
     c->ramp_ticks = 0U;
     c->yaw_ref = 0.0f;      /* [PIVOT 2026-11-14] */
     c->pivot_ticks = 0U;    /* [PIVOT 2026-11-14] */
@@ -54,6 +55,13 @@ void Corner_Reset(CornerState *c)
 uint8_t Corner_IsActive(const CornerState *c)
 {
     return (c->state != 0U) ? 1U : 0U;
+}
+
+/* [COOLDOWN 2026-11-18] 出弯冷却改为距离制：走过 CORNER_COOLDOWN_CM 才解禁。
+   时间制（0.4 s）在 BASE 120 下等于 11 cm，比锯齿段的角间距还长。 */
+uint8_t Corner_IsCooling(const CornerState *c)
+{
+    return (c->dist < c->cooldown_dist) ? 1U : 0U;
 }
 
 void Corner_AddDistance(CornerState *c, uint32_t counts)
@@ -87,7 +95,12 @@ static uint8_t Corner_SideOfMask(uint16_t mask, float *dir)
 /* 进入过弯四段（通用锁存与直角弯检测共用，保证两处初始化一致） */
 static void Corner_Enter(CornerState *c, float dir)
 {
+#if (CORNER_MODE == 1)
+    /* [ARC 2026-11-18] 弧线模式：不停车，直接进偏航双环 */
+    c->state = CORNER_ST_ARC;
+#else
     c->state = CORNER_ST_APPROACH;
+#endif
     c->dir   = dir;
 
     Motor_SetBoost(1U);     /* [BRAKE 2026-11-15] 进弯先恢复死区补偿，刹车段再关 */
@@ -112,10 +125,12 @@ static void Corner_Enter(CornerState *c, float dir)
     c->settle_ticks = 0U;   /* [SETTLE 2026-11-15] */
     c->recover_dir = 0.0f;  /* [RECOVER 2026-11-16] */
     c->recover_ticks = 0U;
+    c->arc_ticks = 0U;      /* [ARC 2026-11-18] */
+    c->arc_line_ticks = 0U;
 }
 
 /* 直角弯状态机：巡线时每拍调用（包括 cnt==0 的拍） */
-static void Corner_Watch(CornerState *c, uint16_t mask, int cnt,
+static void Corner_Watch(CornerState *c, uint16_t mask, int cnt, float error,
                          float *dir_out, uint8_t *fire, uint8_t *gave_up)
 {
     *fire = 0U;
@@ -130,6 +145,7 @@ static void Corner_Watch(CornerState *c, uint16_t mask, int cnt,
             c->cw_side  = d;
             c->cw_mask  = mask;         /* [诊断] 定方向用的那一拍掩码 */
             c->cw_ticks = 0U;
+            c->cw_wide  = 0U;           /* [ARC] 宽线总拍数 */
             c->cw_dark  = 0U;
             c->cw_low   = 0U;
         }
@@ -137,6 +153,7 @@ static void Corner_Watch(CornerState *c, uint16_t mask, int cnt,
     }
 
     ++c->cw_ticks;
+    ++c->cw_wide;
 
     /* [FIX 2026-11-16] WIDE 期间**持续更新方向**，用"最后一帧"而不是"第一帧"。
        实测 直角错误1：进入 WIDE 的第一帧是 ch7~10（线刚偏到右边，是车的横向偏置），
@@ -188,6 +205,19 @@ static void Corner_Watch(CornerState *c, uint16_t mask, int cnt,
             }
         }
     }
+
+#if (CORNER_MODE == 1)
+    /* [ARC 2026-11-18] 弧线模式：宽线 + 误差已接近极限 才触发。
+       只用"宽线"会把缓弯、十字路口（mask=4095）全当成直角弯。 */
+    if ((c->cw_wide >= ARC_WIDE_TICKS) &&
+        ((error > ARC_TRIG_ERR) || (error < -ARC_TRIG_ERR)))
+    {
+        *dir_out = c->cw_side;
+        *fire = 1U;
+        c->cw_state = 0U;
+        return;
+    }
+#endif
 
     if (c->cw_dark >= CW_DARK_TICKS)    /* 宽线之后全黑 -> 判定直角弯 */
     {
@@ -295,7 +325,7 @@ float Corner_Update(CornerState *c,
             else
             {
                 c->state      = CORNER_ST_LINE;
-                c->cooldown   = CORNER_COOLDOWN;
+            c->cooldown_dist = c->dist + CORNER_COOLDOWN_COUNTS;
                 c->ramp_ticks = CORNER_RAMP_TICKS;
             }
         }
@@ -476,7 +506,7 @@ float Corner_Update(CornerState *c,
             }
 
             c->state = CORNER_ST_LINE;
-            c->cooldown = CORNER_COOLDOWN;
+            c->cooldown_dist = c->dist + CORNER_COOLDOWN_COUNTS;
             c->ramp_ticks = CORNER_RAMP_TICKS;
 
             /* 收尾结束才恢复默认速度环增益（收尾段仍用 pivot 的大增益） */
@@ -499,6 +529,81 @@ float Corner_Update(CornerState *c,
         return c->dir * mag;
     }
 
+    /* ---- 段 6：带速度弧线（[ARC 2026-11-18] CORNER_MODE=1）
+       不停车，用陀螺双环把车头转过 ARC_YAW_DEG：
+         外环：ω_des = K_YAW·(目标角 − 当前角)，限幅 ±200°/s
+         内环：turn  = ω_des/1.644 + K_OMEGA·(ω_des − ω)
+       全程 speed = BASE，turn ≤ speed（内轮最低 0，不反转）。 */
+    if (c->state == CORNER_ST_ARC)
+    {
+        float yaw_r;
+        float rate_r;
+        float err_deg;
+        float omega_des;
+        float turn_r;
+
+        ++c->arc_ticks;
+        if (gyro_ok)
+            c->yaw += gyro_z * 0.01f;
+
+        yaw_r  = c->dir * c->yaw;
+        rate_r = c->dir * gyro_z;
+
+        *speed_cmd = ARC_CREEP_SPEED;        /* [PIVOT-C] 慢速 creep：旋转中心回到轴心附近 */
+
+        err_deg   = ARC_YAW_DEG - yaw_r;
+        omega_des = ARC_K_YAW * err_deg;
+        if (omega_des >  ARC_OMEGA_MAX) omega_des =  ARC_OMEGA_MAX;
+        if (omega_des < -ARC_OMEGA_MAX) omega_des = -ARC_OMEGA_MAX;
+
+        turn_r = omega_des / OMEGA_PER_TURN + ARC_K_OMEGA * (omega_des - rate_r);
+
+        if (turn_r < 0.0f) turn_r = 0.0f;
+        if (turn_r > ARC_TURN_MAX) turn_r = ARC_TURN_MAX;
+        /* [PIVOT-C] 这里不再钳 turn ≤ speed——
+           内轮要反转（25−120=−95），旋转中心才能回到轴心附近。 */
+
+        /* 出弯：转够且角速度已经收住 */
+        if ((err_deg < ARC_YAW_TOL) &&
+            (rate_r < 20.0f) && (rate_r > -20.0f))
+        {
+            c->state = CORNER_ST_LINE;
+            c->cooldown_dist = c->dist + CORNER_COOLDOWN_COUNTS;
+            c->ramp_ticks = CORNER_RAMP_TICKS;
+            Motor_SetSpeedGains(SPEED_KP_DEFAULT, SPEED_KI_DEFAULT);
+            return 0.0f;
+        }
+
+        /* 线提前回来（细且居中）也可以交回 */
+        if ((cnt > 0) && (error > -2.0f) && (error < 2.0f))
+        {
+            if (c->arc_line_ticks < 250U) ++c->arc_line_ticks;
+            if (c->arc_line_ticks >= 5U)
+            {
+                c->state = CORNER_ST_LINE;
+                c->cooldown_dist = c->dist + CORNER_COOLDOWN_COUNTS;
+                c->ramp_ticks = CORNER_RAMP_TICKS;
+                Motor_SetSpeedGains(SPEED_KP_DEFAULT, SPEED_KI_DEFAULT);
+                return 0.0f;
+            }
+        }
+        else
+        {
+            c->arc_line_ticks = 0U;
+        }
+
+        if (c->arc_ticks >= ARC_MAX_TICKS)               /* 兜底 */
+        {
+            c->state = CORNER_ST_LINE;
+            c->cooldown_dist = c->dist + CORNER_COOLDOWN_COUNTS;
+            c->ramp_ticks = CORNER_RAMP_TICKS;
+            Motor_SetSpeedGains(SPEED_KP_DEFAULT, SPEED_KI_DEFAULT);
+            return 0.0f;
+        }
+
+        return c->dir * turn_r;
+    }
+
     /* ---- 段 5：反向找线（[RECOVER 2026-11-16] 新增）
        转满 90° 之后如果还是看不到线（方向判错、或冲过头），
        反方向原地转最多 CORNER_RECOVER_DEG，转的过程中一看到线就交回巡线；
@@ -517,7 +622,7 @@ float Corner_Update(CornerState *c,
         if (cnt > 0)                           /* 找到了：交回巡线 */
         {
             c->state      = CORNER_ST_LINE;
-            c->cooldown   = CORNER_COOLDOWN;
+        c->cooldown_dist = c->dist + CORNER_COOLDOWN_COUNTS;
             c->ramp_ticks = CORNER_RAMP_TICKS;
 
             Motor_SetSpeedGains(SPEED_KP_DEFAULT, SPEED_KI_DEFAULT);
@@ -529,9 +634,9 @@ float Corner_Update(CornerState *c,
         if ((ya >= CORNER_RECOVER_DEG) || (c->recover_ticks >= CORNER_RECOVER_TICKS))
         {
             /* 放弃：回 LINE，后面由 LOST_STOP_TICKS 触发停车 */
-            c->state      = CORNER_ST_LINE;
-            c->cooldown   = 0U;
-            c->ramp_ticks = 0U;
+            c->state         = CORNER_ST_LINE;
+            c->cooldown_dist = c->dist;      /* [COOLDOWN] 不设冷却 */
+            c->ramp_ticks    = 0U;
 
             Motor_SetSpeedGains(SPEED_KP_DEFAULT, SPEED_KI_DEFAULT);
             return 0.0f;
@@ -542,8 +647,7 @@ float Corner_Update(CornerState *c,
     }
 
     /* ---- 正常巡线 ---- */
-    if (c->cooldown > 0U)
-        --c->cooldown;
+    /* [COOLDOWN 2026-11-18] 冷却改成距离制，这里不再递减计数 */
 
     /* [ARM 2026-11-15] 重新武装：误差连续 CORNER_ARM_TICKS 拍低于锁存阈值，
        才允许下一次锁存。没有这一条，一次没转准就会“再锁存再转”，
@@ -567,9 +671,9 @@ float Corner_Update(CornerState *c,
         uint8_t cw_fire = 0U;
         uint8_t cw_gave_up = 0U;
 
-        Corner_Watch(c, mask, cnt, &cw_dir, &cw_fire, &cw_gave_up);
+        Corner_Watch(c, mask, cnt, error, &cw_dir, &cw_fire, &cw_gave_up);
 
-        if ((cw_fire != 0U) && (c->cooldown == 0U) && (c->armed != 0U))
+        if ((cw_fire != 0U) && (Corner_IsCooling(c) == 0U) && (c->armed != 0U))
         {
             Corner_Log(1U, cw_dir, mask, c->cw_mask, cnt, error);   /* [CORN] 1 = 直角弯检测触发 */
             Corner_Enter(c, cw_dir);
@@ -604,7 +708,7 @@ float Corner_Update(CornerState *c,
             && ((uint32_t)cnt >= CORNER_ENTER_CNT)
             && (c->armed != 0U)
             && (hex_zone_flag == 0U)        /* [HEX-ZONE] 六边形区间内不锁存直角弯 */
-            && c->cooldown == 0U)
+            && (Corner_IsCooling(c) == 0U))
         {
             float dir = (pid_turn >= 0.0f) ? 1.0f : -1.0f;
             if (abs_turn < 0.5f)
@@ -649,6 +753,10 @@ void Hex_Reset(HexState *h)
     h->cond_seen = 0U;
     h->arm_lost = 0U;
     h->zone = 0U;
+    h->v_stack = 0U;         /* [DBLHEX 2026-11-18] */
+    h->hex_yaw = 0.0f;
+    h->half_done = 0U;
+    h->full_done = 0U;
     h->zone_dist = 0U;
     h->v_active = 0U;
     h->v_yaw = 0.0f;
@@ -675,6 +783,12 @@ void Hex_AddDistance(HexState *h, uint32_t counts)
     h->dist += counts;
 }
 
+/* [TURNBIAS 2026-11-18] 是否在六边形区间内（区间内允许更大的转向能力） */
+uint8_t Hex_ZoneActive(void)
+{
+    return hex_zone_flag;
+}
+
 HexOutput Hex_Update(HexState *h,
                      CornerState *corner,
                      uint8_t center,
@@ -699,13 +813,44 @@ HexOutput Hex_Update(HexState *h,
        原因：六边形触发是"武装后走够 10 cm"的纯距离计时器，而 dist 用的是
        (|dL|+|dR|)/2 —— pivot 时两轮反向，照样累加但不前进。
        一次 90° pivot 就灌进 6~7 cm 假里程，直角弯出口就会误触发一次原地转。 */
-    if ((Corner_IsActive(corner) != 0U) || (corner->cooldown > 0U))
+    if ((Corner_IsActive(corner) != 0U) || (Corner_IsCooling(corner) != 0U))
     {
         h->event_cnt = 0U;
         h->v_active  = 0U;
         h->v_prev    = 0U;
         h->arm_lost  = 0U;
+        hex_zone_flag = h->zone;    /* [BLIND 2026-11-18] 提前返回也要刷新这个标志，
+                                       否则过弯期间它会停在旧值 1，把断线斜穿永久挡掉 */
         return out;
+    }
+
+    /* [DBLHEX 2026-11-18] 累计转角（每拍跑，与 V 无关）：
+       入栈时为 0；沿六边形方向累计；到 180° 归零并标记半程；
+       第二段再累计 180°（总 360°）标记整程完成。 */
+    if (h->v_stack != 0U)
+    {
+        float ya;
+
+        if (gyro_ok)
+            h->hex_yaw += h->dir * gyro_z * 0.01f;
+
+        ya = (h->hex_yaw >= 0.0f) ? h->hex_yaw : -h->hex_yaw;
+
+        if (h->half_done == 0U)
+        {
+            if (ya >= HEX_HALF_DEG)
+            {
+                h->half_done = 1U;
+                h->hex_yaw   = 0.0f;    /* 归零重新累计 */
+            }
+        }
+        else if (h->full_done == 0U)
+        {
+            if (ya >= HEX_FULL_DEG)
+            {
+                h->full_done = 1U;      /* 总 360° 已满，之后的 V 才允许出栈 */
+            }
+        }
     }
 
     /* ---- V 型判据（[HEX-V 2026-11-15]） --------------------------------
@@ -732,20 +877,43 @@ HexOutput Hex_Update(HexState *h,
 
         int8_t s = (v_l != v_r) ? (int8_t)(v_l ? 1 : -1) : (int8_t)0;
 
-        /* 第一次 V：严判据 + 未武装 + 上升沿 */
+        /* [DBLHEX 2026-11-18] 用"累计转角"决定 V 的含义：
+             栈空          + V -> 入栈（入口，10 cm 后转 30°）
+             栈满 未满360°  + V -> 忽略（中途的 V 不是出口）
+             栈满 已满360°  + V -> 出栈（出口，**不打舵**） */
         if ((h->event_cnt == 0U) && (h->v_active == 0U) &&
             (s != 0) && (h->v_prev == 0U))
         {
-            h->event_cnt = 1U;
-            h->dir       = (float)s;
-            h->v_dist    = h->dist;
-            h->cond_seen = 0U;                      /* [诊断] 本次武装还没见过触发条件 */
-            h->arm_lost  = 0U;                      /* [FIX] 丢线计数清零 */
-            h->zone      = 1U;                      /* [HEX-ZONE] 进入/延续六边形区间 */
-            h->zone_dist = h->dist;
-            h->dbg_event = 4U;                      /* 4 = 武装 */
-            h->dbg_dist  = h->dist;
-            ++h->evt_seq;
+            if (h->v_stack == 0U)
+            {
+                /* ---- 入栈 ---- */
+                h->v_stack   = 1U;
+                h->hex_yaw   = 0.0f;        /* 陀螺归零，开始累计 */
+                h->half_done = 0U;
+                h->full_done = 0U;
+
+                h->event_cnt = 1U;
+                h->dir       = (float)s;
+                h->v_dist    = h->dist;
+                h->cond_seen = 0U;
+                h->arm_lost  = 0U;
+                h->zone      = 1U;
+                h->zone_dist = h->dist;
+                h->dbg_event = 4U;          /* 4 = 武装（入栈） */
+                h->dbg_dist  = h->dist;
+                ++h->evt_seq;
+            }
+            else if (h->full_done != 0U)
+            {
+                /* ---- 出栈：整程 360° 已满，出口的 V，不转 ---- */
+                h->v_stack   = 0U;
+                h->zone      = 0U;
+                h->zone_dist = h->dist;
+                h->dbg_event = 9U;          /* 9 = 出口 V（出栈，不打舵） */
+                h->dbg_dist  = h->dist;
+                ++h->evt_seq;
+            }
+            /* 其余情况：中途 V，忽略 */
         }
         /* 第二次：**纯距离触发**（回到最初的设计思路）。
            实测 2026-11-15（六边出错2）：9 cm 之前 c(ch5&ch6) 一直亮、之后必灭，
@@ -778,8 +946,12 @@ HexOutput Hex_Update(HexState *h,
                     h->v_active   = 1U;
                     h->v_yaw      = 0.0f;           /* [原地转] 角度从这里开始累计 */
                     h->turn_ticks = HEX_V_MAX_TICKS;
-                    h->zone       = 1U;             /* [HEX-ZONE] 顺延区间 */
-                    h->zone_dist  = h->dist;
+                    /* [HEX-ZONE 2026-11-18] 触发时同样不续命（区间仍从第一次 V 算起） */
+                    if (h->zone == 0U)
+                    {
+                        h->zone      = 1U;
+                        h->zone_dist = h->dist;
+                    }
                     h->dbg_event  = 5U;             /* 5 = 触发（开始原地转） */
                     h->dbg_dist   = gap;
                     ++h->evt_seq;
@@ -850,11 +1022,15 @@ HexOutput Hex_Update(HexState *h,
         }
     }
 
-    /* [HEX-ZONE] 区间超时：最近一次 V 之后走了 HEX_ZONE_CM 还没再见到 V -> 离开六边形 */
-    if ((h->zone != 0U) && ((h->dist - h->zone_dist) > HEX_ZONE_COUNTS))
+    /* [HEX-ZONE] 区间超时：最近一次 V 之后走了 HEX_ZONE_CM 还没再见到 V -> 离开六边形
+       [DBLHEX 2026-11-18] 但"在栈内"时不按距离超时——双六边形跑一圈 360° 可能超过
+       150 cm，距离超时会让区间在半路失效。出栈时才关区间。 */
+    if ((h->zone != 0U) && (h->v_stack == 0U) &&
+        ((h->dist - h->zone_dist) > HEX_ZONE_COUNTS))
     {
         h->zone = 0U;
     }
+
     hex_zone_flag = h->zone;
 
     return out;
