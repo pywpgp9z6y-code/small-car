@@ -10,8 +10,12 @@ typedef enum {
     CORNER_ST_BRAKE    = 2U,   /* 刹停 */
     CORNER_ST_PIVOT    = 3U,   /* 原地转（粗转） */
     CORNER_ST_SETTLE   = 4U,   /* [SETTLE 2026-11-15] 航向收尾：把粗转剩下的几度补掉 */
-    CORNER_ST_RECOVER  = 5U,   /* [RECOVER 2026-11-16] 转完仍丢线：反向找 30° */
-    CORNER_ST_ARC      = 6U    /* [ARC 2026-11-18] 带速度弧线过弯（偏航双环） */
+    CORNER_ST_RECOVER  = 5U,   /* [RECOVER 2026-11-16] 转完仍丢线：反向找（上限 CORNER_RECOVER_DEG） */
+    CORNER_ST_ARC      = 6U,   /* [ARC 2026-11-18] 带速度弧线过弯（偏航双环） */
+    CORNER_ST_ARC_SETTLE = 7U, /* [ARC2 2026-11-21] 弧线断电后的航向收尾 */
+    CORNER_ST_ARC_RECOVER = 8U /* [ARC2 2026-11-21] 收尾到位但还没看到线：
+                                  继续朝**原方向**补转，最多 CORNER_RECOVER_DEG(90°)
+                                  （原来的 RECOVER 是反方向，用于转过头） */
 } CornerPhase;
 
 /* 通用过弯锁存状态 */
@@ -116,6 +120,21 @@ uint8_t Corner_IsActive(const CornerState *c);
 uint8_t Corner_IsCooling(const CornerState *c);   /* [COOLDOWN 2026-11-18] 1 = 还在出弯冷却期 */
 void Corner_AddDistance(CornerState *c, uint32_t counts);   /* [APPROACH 2026-11-14] */
 
+/* [CW2 2026-11-21] 直角弯判据的逐拍记录（串口 'c' 打印）：
+   中断里只存，主循环读。用于实测 CORNER_FULL_HOLD_TICKS / 丢线拍数。 */
+uint8_t Cw_LogCount(void);
+void    Cw_GetAt(uint8_t i, int16_t *cnt, uint16_t *mask, int16_t *err, uint8_t *flag);
+void    Cw_ClearLog(void);
+uint16_t Cw_FireCount(void);       /* [CW2] 判据满足次数 */
+uint16_t Cw_EnterCount(void);      /* [CW2] 真正进状态机（= 真的打舵）次数 */
+uint16_t Cw_BlockArm(void);        /* [CW2] 判据满足但没武装 */
+uint16_t Cw_BlockCool(void);       /* [CW2] 判据满足但在冷却期 */
+
+/* [ISR-SAFE 2026-11-21] 过弯事件：中断里只存，主循环取出来打印。
+   取到返回 1；没有事件返回 0。 */
+uint8_t Corner_PopEvent(uint8_t *why, int8_t *dir, uint16_t *mask, uint16_t *cw_mask,
+                        int16_t *cnt, int16_t *err10);
+
 /* 返回最终 turn；speed_cmd 由函数写入。
    pid_turn 是方向环 PID + 二次项、限幅后的值。
    speed_meas 是编码器实测速度（左右平均），刹车段用它判停。 */
@@ -143,5 +162,30 @@ HexOutput Hex_Update(HexState *h,
                      uint8_t gyro_ok,     /* [原地转] 陀螺可用 */
                      float gyro_z);       /* [原地转] 角速度 °/s */
 void Hex_GetDebug(const HexState *h, HexDebug *d);
+
+/* [HEX4 2026-11-21] 六边形"两次 V"状态机（按现场描述重写）。
+   与老 Hex_Update 的区别见 special.c 里的注释。
+   error / pid_turn 用来判"大误差方向"和"第一次 V 之后的回正"。 */
+HexOutput Hex_Update4(HexState *h,
+                      CornerState *corner,
+                      uint8_t center,
+                      uint8_t right,
+                      uint8_t left,
+                      uint16_t mask,
+                      uint8_t gyro_ok,
+                      float gyro_z,
+                      float error,
+                      float pid_turn);
+
+void Hex4_Reset(void);     /* 发车/停车时清状态，Hex_Reset 里会调用 */
+
+/* [HEX4 2026-11-21] 六边形事件队列：中断里入队，主循环按序打印（不会丢事件） */
+uint8_t Hex_PopEvent(uint8_t *code, uint32_t *dist, uint16_t *mask,
+                     uint8_t *right, uint8_t *left, uint8_t *center, uint16_t *seq);
+
+/* [HEX4] V 判据的逐拍记录（串口 'h' 打印），用于重新设计判定条件 */
+uint8_t HexLog_Count(void);
+void    HexLog_GetAt(uint8_t i, int16_t *cnt, uint16_t *mask, int16_t *err, uint8_t *flag);
+void    HexLog_Clear(void);
 
 #endif /* SPECIAL_H */

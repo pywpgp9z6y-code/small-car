@@ -18,6 +18,7 @@
  */
 #include "main.h"
 #include <stdio.h>          /* [BLIND] printf 诊断 */
+#include <math.h>           /* [SPEED300] sqrtf：前视距离随速度自适应 */
 #include "control.h"
 #include "car_config.h"
 #include "car_state.h"
@@ -38,6 +39,15 @@ static uint8_t hex_pivot_active;   /* [原地转] 六边形入口正在原地转
 static float   turn_prev;          /* [SLEW 2026-11-16] 上一拍的转向命令 */
 static float   err_f;              /* [KINEMA 2026-11-18] 低通后的误差（单位：路） */
 static float   err_prev;           /* [KINEMA 2026-11-18] 上一拍滤波后的误差（算微分） */
+static uint8_t near_d;             /* [SPEED300 2026-11-21] 1 = 当前用短前视（进弯中） */
+static uint8_t line_hold_ticks;    /* [HOLD 2026-11-21] 丢线后已保持转向的拍数 */
+static float   line_hold_turn;     /* [HOLD] 丢线前一拍的舵量 */
+static uint8_t rec2_done;          /* [RECOVER2] 1 = 同向补转已经做完（或本次丢线不允许补转） */
+static uint8_t rec2_ticks;         /* [RECOVER2] 补转计时 */
+static float   rec2_yaw;           /* [RECOVER2] 丢线后累计转角（HOLD 段也算） */
+static float   rec2_dir;           /* [RECOVER2] 补转方向：由丢线前一拍的 error 符号定 */
+static uint8_t rec2_armed;         /* [RECOVER2] 1 = 丢线前 |error| 够大，允许补转 */
+static uint8_t rec2_pivot;         /* [RECOVER2] 1 = 本拍正在原地补转（速度环前馈按 pivot 给） */
 
 /* [BLIND 2026-11-18] 断线区斜穿状态 */
 static uint8_t  blind_phase;       /* 0=关 1=转向到目标角 2=保持航向直行 */
@@ -87,6 +97,14 @@ static void Car_Stop(void)
     turn_prev = 0.0f;      /* [SLEW 2026-11-16] 停车后清掉斜率基准 */
     err_f     = 0.0f;      /* [KINEMA 2026-11-18] 清掉误差滤波状态 */
     err_prev  = 0.0f;
+    near_d    = 0U;        /* [SPEED300 2026-11-21] */
+    line_hold_ticks = 0U;  /* [HOLD 2026-11-21] */
+    line_hold_turn  = 0.0f;
+    rec2_done       = 1U;  /* [RECOVER2] 停车后本次丢线不补转，等下一次看到线重新判定 */
+    rec2_ticks      = 0U;
+    rec2_yaw        = 0.0f;
+    rec2_armed      = 0U;
+    rec2_pivot      = 0U;
     blind_phase = 0U;      /* [BLIND 2026-11-18] */
     blind_yaw   = 0.0f;
     blind_dist  = 0U;
@@ -320,6 +338,22 @@ static uint8_t Control_Direction(void)
 
             d = (Hex_ZoneActive() != 0U) ? PURSUIT_L_CM_HEX : PURSUIT_L_CM;
 
+            /* [SPEED300 2026-11-21] 只在"大误差"时收短前视，其余情况保持 10 cm。
+               固定 10 cm 时 G = 13.3×300/100 = 40，直道是"有力气"的；
+               之前把 d 随 √v 放大到 14.1 会把 G 压到 20 —— 手感就是"方向环没劲"，
+               所以那套放大撤掉，直道恢复 G=40。
+               弯里需要更大权限：几何上 d 处最多只能报出 3.3 cm 侧偏，
+               可表达的最小半径 R = d²/(2×3.3)：d=10 时 R≥15 cm，跑不了 45°；
+               d=8 时 R_min=9.7 cm，G=62。所以 |err|>CORNER_NEAR_ERR 才切短。
+               回差（2.0 进 / 1.2 出）避免 G 在门限附近 40↔62 来回跳。 */
+            if ((err_f > CORNER_NEAR_ERR) || (err_f < -CORNER_NEAR_ERR))
+                near_d = 1U;
+            else if ((err_f < CORNER_NEAR_ERR * 0.6f) && (err_f > -CORNER_NEAR_ERR * 0.6f))
+                near_d = 0U;
+
+            if (near_d != 0U)
+                d = PURSUIT_L_CM_NEAR;
+
             /* [KINEMA 2026-11-18] 符号约定：error = bias - 5.5，error>0 表示线在右侧，
                车应该右转（turn < 0）。所以这里必须带负号——漏掉负号会变成正反馈，
                车会越偏越往外打舵、直接乱转（新方案错误1 就是这个）。 */
@@ -367,9 +401,12 @@ static uint8_t Control_Direction(void)
     }
 
     /* 4) 六边形检测先跑，会取消通用过弯锁存 */
-    hex_out = Hex_Update(&hex, &corner,
-                         line.center, line.right, line.left, line.mask,
-                         Gyro_IsOk(), Gyro_GetZ());   /* [原地转] 陀螺闭环 */
+    /* [HEX4 2026-11-21] 换成"两次 V"状态机：多传当前误差和方向环舵量
+       （误差用来判"大误差方向"，舵量用来做第一次 V 之后的回正）。 */
+    hex_out = Hex_Update4(&hex, &corner,
+                          line.center, line.right, line.left, line.mask,
+                          Gyro_IsOk(), Gyro_GetZ(),
+                          line.error, pid_turn);
 
     /* [原地转] 六边形入口在做原地转时，前馈必须按 pivot 给（FF_PIVOT），
        否则 FF_DRIVE×45 只有 144，连死区都越不过去。
@@ -418,7 +455,15 @@ static uint8_t Control_Direction(void)
     {
         if (blind_phase == 0U)
         {
-            if ((line.cnt == 0U) && (car.lost_cnt >= BLIND_START_TICKS))
+            /* [HOLD 2026-11-21] 等"丢线保持转向"用完之后再启动盲穿。
+               否则 HOLD 只跑 BLIND_START_TICKS(5) 拍就被盲穿抢走，
+               60° 弯需要 ~15 拍，根本来不及。
+               [BLIND-GATE 2026-11-21] 再加一条：丢线前误差必须 <= 1 路。
+               盲穿是给"线断了/有个缺口"用的——那时车基本是正对着线。
+               如果丢线前误差已经很大，说明是弯而不是断线，这时不该盲目直穿。 */
+            if ((line.cnt == 0U) && (car.lost_cnt >= BLIND_START_TICKS) &&
+                (line_hold_ticks >= LINE_HOLD_TICKS) && (rec2_done != 0U) &&
+                (err_f <  BLIND_MAX_ABS_ERR) && (err_f > -BLIND_MAX_ABS_ERR))
             {
                 blind_phase = 1U;
                 blind_dir   = BLIND_DIR_FIXED;   /* [BLIND] 方向固定，不看丢线前的误差 */
@@ -426,7 +471,11 @@ static uint8_t Control_Direction(void)
                 blind_dist  = 0U;
                 blind_seen  = 0U;
                 blind_tick  = 0U;
-                printf("BLD,1,%d,%d,%d\r\n", (int)car.lost_cnt, (int)blind_dir, (int)(err_f * 10.0f));
+                /* [ISR-SAFE 2026-11-21] 这条也在中断里：一行 ~20 字符 = 1.7 ms，
+                   超过 1 ms 节拍。盲穿启动本身只需要一个标志，不需要当场打印。
+                   要观察就改成"写快照 + 主循环打印"，别直接放开下面这行。 */
+                /* printf("BLD,1,%d,%d,%d\r\n",
+                          (int)car.lost_cnt, (int)blind_dir, (int)(err_f * 10.0f)); */
             }
         }
         else
@@ -485,13 +534,106 @@ static uint8_t Control_Direction(void)
         }
     }
 
+    /* [HOLD 2026-11-21] 丢线后保持转向。
+       45°/60° 弯时线会在 5~6 拍内滑出阵列：那一拍 line.cnt=0，
+       have_control 变 0，下面分支会把两个轮子的目标**瞬间清零** ——
+       车就直冲出去，看起来"方向环完全没努力"。
+       这里在丢线后继续用最后一拍的舵打 8 拍（80 ms ≈ 5 cm），
+       让车往线消失的方向拐，很可能在保持期内重新压到线。
+       只影响"丢线瞬间"，直道手感不变。 */
+    /* [RECOVER2 2026-11-21] 每拍先清"正在补转"标志，只有下面真正原地打舵时才置 1。
+       速度环的 FF_IsPivotMode() 和"不反转护栏"都看它。 */
+    rec2_pivot = 0U;
+
+    /* [RECOVER2] 过弯状态机运行期间不参与普通丢线补转：补角由
+       CORNER_ST_ARC_RECOVER / RECOVER 负责，避免出弯后又来一次同向大补转。 */
+    if (Corner_IsActive(&corner) != 0U)
+    {
+        rec2_armed = 0U;
+        rec2_done  = 1U;
+    }
+
+    if (line.cnt > 0U)
+    {
+        float ae = (line.error >= 0.0f) ? line.error : -line.error;
+
+        line_hold_ticks = 0U;
+        line_hold_turn  = turn;
+        rec2_ticks      = 0U;
+        rec2_yaw        = 0.0f;
+
+        /* [RECOVER2] 方向 = 线消失的那一侧：error>0（线在右）-> turn<0（右转）。
+           资格 = 丢线前一拍 |error| 够大（是弯，不是断线缺口）+ 陀螺可用
+                + 不在六边形区间 + 不在过弯状态机里。 */
+        rec2_dir   = (line.error > 0.0f) ? -1.0f : 1.0f;
+        rec2_armed = ((ae >= RECOVER2_ERR_MIN) &&
+                      (Gyro_IsOk() != 0U) &&
+                      (Hex_ZoneActive() == 0U) &&
+                      (Corner_IsActive(&corner) == 0U)) ? 1U : 0U;
+        /* 不满足资格就不补转：行为退回"HOLD + 盲穿"（和原来一样） */
+        rec2_done  = (rec2_armed != 0U) ? 0U : 1U;
+    }
+    else if ((Corner_IsActive(&corner) == 0U) && (blind_phase == 0U))
+    {
+        /* [RECOVER2] 转角从"丢线那一刻"开始累计（HOLD 段也算在内），
+           所以 RECOVER2_DEG(90°) 是总补转角，不是只算原地转那一段。 */
+        if ((rec2_armed != 0U) && (Gyro_IsOk() != 0U))
+            rec2_yaw += Gyro_GetZ() * 0.01f;
+
+        if (line_hold_ticks < LINE_HOLD_TICKS)
+        {
+            float mag = (line_hold_turn >= 0.0f) ? line_hold_turn : -line_hold_turn;
+
+            ++line_hold_ticks;
+
+            /* 丢线说明前面是弯：不要冻结在丢线那一拍的舵量（那时还在爬坡），
+               继续按 LINE_HOLD_SLEW 往上顶，直到 TURN_MAX。 */
+            mag += LINE_HOLD_SLEW;
+            if (mag > TURN_MAX) mag = TURN_MAX;
+
+            /* [RECOVER2 2026-11-21] 补转方向已经由"丢线前 error"定死（rec2_dir），
+               HOLD 也朝同一侧，避免 HOLD 按上一拍 PID 的符号打一下、补转再反向，
+               车子先反打再补、白走角度。 */
+            if (rec2_armed != 0U)
+                line_hold_turn = (rec2_dir >= 0.0f) ? mag : -mag;
+            else
+                line_hold_turn = (line_hold_turn >= 0.0f) ? mag : -mag;
+
+            turn          = line_hold_turn;
+            car.speed_cmd = BASE_SPEED * LINE_HOLD_SPEED_K;
+            have_control  = 1U;
+        }
+        else if (rec2_done == 0U)
+        {
+            /* [RECOVER2 2026-11-21] HOLD 用完还没线：向丢线前 error 的方向原地补转，
+               上限 RECOVER2_DEG(90°)；没线时一直接着转，看到线立刻交回方向环
+               （上面 line.cnt>0 那支会清标志）。
+               注意：以前这里 turn=±45 + speed=0 会被下面的"不反转护栏"钳成 0，
+               所以整套补转其实从来没动过 —— 现在护栏对 rec2_pivot 放行。 */
+            ++rec2_ticks;
+
+            if ((rec2_yaw * rec2_dir >= RECOVER2_DEG) ||
+                (rec2_ticks >= RECOVER2_TICKS))
+            {
+                rec2_done = 1U;               /* 补满 90° / 超时：放手，让盲穿/停车接手 */
+            }
+            else
+            {
+                turn          = rec2_dir * RECOVER2_TURN;
+                car.speed_cmd = 0.0f;         /* 原地转 */
+                rec2_pivot    = 1U;
+                have_control  = 1U;
+            }
+        }
+    }
+
     /* 5) 差速 -> 左右目标速度（过弯/正常统一在这里写） */
     if (have_control)
     {        /* [NOSPIN 2026-11-18] 不反转护栏：巡线/六边形弧线阶段，turn 不允许超过
            speed_cmd，否则内轮目标为负 -> 电机反接制动（电流数倍、驱动易烧）。
            pivot/原地转走的是另一条路（target 允许为负），所以这里要排除。 */
         if ((!corner_was_active) && (!Corner_IsActive(&corner)) &&
-            (car.spin.mode == 0U) && (hex_pivot_active == 0U))
+            (car.spin.mode == 0U) && (hex_pivot_active == 0U) && (rec2_pivot == 0U))
         {
             if (turn >  car.speed_cmd) turn =  car.speed_cmd;
             if (turn < -car.speed_cmd) turn = -car.speed_cmd;
@@ -508,11 +650,14 @@ static uint8_t Control_Direction(void)
         if (pid_R.target < -TARGET_MAX) pid_R.target = -TARGET_MAX;
 
         /* [BRAKE 2026-11-18] 弧线起步反向脉冲：
-           EN=0 是滑行，内轮从 120 掉到 0 要 0.27 s（车前进 7 cm 才开始转）。
-           这里给内轮一个短促反接，把它压到 ~0.06 s。
-           [PIVOT-C] 方案 C 的内轮本来就在反转（25−120=−95），不再需要这个脉冲。 */
+           EN=0 是滑行，内轮从 300 掉到 0 要 0.27 s，而 ARC2 整个转弯只有 0.37 s ——
+           前 3/4 的时间都在等它停，半径被拉大，所以"时而成功时而失败"。
+           这里给内轮一个反接脉冲，把它压到 0.06~0.1 s。
+           [ARC2 2026-11-21] 窗口从固定 5 拍改成 20 拍 + 实测速度门：
+           只要内轮还 > ARC_BRAKE_SPEED_MIN 就一直刹，慢下来就自动停，
+           不依赖电池电压/入弯速度，成功率高得多。 */
 #if (ARC_BRAKE_ENABLE == 1)
-        if ((corner.state == CORNER_ST_ARC) && (corner.arc_ticks <= ARC_BRAKE_TICKS))
+        if ((corner.state == CORNER_ST_ARC) && (corner.arc_ticks <= ARC_BRAKE_MAX_TICKS))
         {
             if (turn > 0.0f)                 /* 左转：内轮是左轮 */
             {
@@ -526,7 +671,7 @@ static uint8_t Control_Direction(void)
             }
         }
 #endif
-				if (!corner_was_active && !Corner_IsActive(&corner)) {   /* [PIVOT 2026-11-14] 锁存期允许一侧目标为负（两轮反向） */
+				if (!corner_was_active && !Corner_IsActive(&corner) && (rec2_pivot == 0U)) {   /* [PIVOT 2026-11-14] 锁存期允许一侧目标为负（两轮反向） */
         if (pid_L.target < 0.0f) pid_L.target = 0.0f;
         if (pid_R.target < 0.0f) pid_R.target = 0.0f;
 			}
@@ -554,6 +699,7 @@ static uint8_t FF_IsPivotMode(void)
                      (corner.state == CORNER_ST_PIVOT) ||
                      (corner.state == CORNER_ST_SETTLE) ||
                      (corner.state == CORNER_ST_RECOVER) ||   /* [RECOVER 2026-11-16] 找线也是原地转 */
+                     (rec2_pivot != 0U) ||        /* [RECOVER2 2026-11-21] 普通丢线的原地补转 */
                      (hex_pivot_active != 0U));   /* [原地转] 六边形入口原地转也按 pivot 给前馈 */
 }
 
@@ -569,6 +715,25 @@ static float FF_R(float target)
     if (FF_IsPivotMode())
         return (target >= 0.0f) ? FF_PIVOT_R : FF_PIVOT_R_REV;
     return (target >= 0.0f) ? FF_DRIVE_R : FF_DRIVE_R_REV;
+}
+
+/* [SPEED300 2026-11-21] 驱动态前馈要带截距：CCR = 174 + slope×target。
+   纯比例（2.27）只在标定点附近准：target=300 时给 681，实际只要 438（+55% 超驱），
+   而 target=50 时给 113 又跌破死区 150。
+   两点拟合（150→306、1000→1054）给的截距 174 就是死区 + 静摩擦的等效量。
+   pivot 用的是另一套手工标定（14.5/15.4），不加截距。
+   注意：target 小于 MOTOR_MIN_TARGET 时不加——刹车/停车段加 174 会停不下来。 */
+static float FF_Apply(float target, float slope)
+{
+    float ff = slope * target;
+
+    if (FF_IsPivotMode())
+        return ff;
+
+    if (target >  MOTOR_MIN_TARGET) ff += FF_DRIVE_OFFSET;
+    if (target < -MOTOR_MIN_TARGET) ff -= FF_DRIVE_OFFSET;
+
+    return ff;
 }
 
 /* 返回 1 = 连续卡死已停车，Control_Update 必须立刻退出（等价于原来的 return）。 */
@@ -699,13 +864,13 @@ static uint8_t Control_Speed(void)
                 speed_R < BASE_SPEED + 5.0f)
             {
                 --car.launch.settle_timer;
-                Motor_Output(FF_L(pid_L.target) * pid_L.target,
-                             FF_R(pid_R.target) * pid_R.target);
+                Motor_Output(FF_Apply(pid_L.target, FF_L(pid_L.target)),
+                             FF_Apply(pid_R.target, FF_R(pid_R.target)));
             }
             else
             {
-                float ff_l = FF_L(pid_L.target) * pid_L.target;
-                float ff_r = FF_R(pid_R.target) * pid_R.target;
+                float ff_l = FF_Apply(pid_L.target, FF_L(pid_L.target));
+                float ff_r = FF_Apply(pid_R.target, FF_R(pid_R.target));
 
                 /* [GND 2026-11-14] 差速前馈：速度前馈降低后，单靠 FF×turn 不足以
                    压过左右电机的效率差，方向环的小修正会被死区吞掉。

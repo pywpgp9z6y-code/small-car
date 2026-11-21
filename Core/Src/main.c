@@ -203,6 +203,8 @@ static uint8_t RUN_Key_Scan(void)
    中断里只置请求标志，动作由主循环启动，避免在中断里做状态迁移。 */
 static volatile uint8_t spin_request = 0U;
 static volatile uint8_t straight_request = 0U;
+static volatile uint8_t cw_dump_request = 0U;   /* [CW2] 打印直角弯判据的逐拍记录 */
+static volatile uint8_t hexlog_request = 0U;    /* [HEX4] 打印 V 判据的逐拍记录 */
 static uint8_t uart_rx_byte = 0U;
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
@@ -213,6 +215,10 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
             spin_request = 1U;
         else if (uart_rx_byte == '3')
             straight_request = 1U;
+        else if (uart_rx_byte == 'c')
+            cw_dump_request = 1U;     /* [CW2] 打印最近 128 拍的 cnt/mask/err/标志 */
+        else if (uart_rx_byte == 'h')
+            hexlog_request = 1U;      /* [HEX4] 打印最近 128 拍的 V 判据原始记录 */
         else if (uart_rx_byte == '0')
             Gyro_ResetYaw();      /* [YAW 2026-11-15] 航向清零，便于手转标定 */
 
@@ -364,6 +370,49 @@ int main(void)
       printf("STRAIGHT_START\r\n");
     }
 
+    /* [ISR-SAFE 2026-11-21] 过弯事件：中断里只存，这里打印。
+       原来 Corner_Log 在 1 kHz 中断里 printf（一行 2.4 ms > 1 ms 节拍），
+       会吞掉控制拍 —— 现在改成主循环来打。 */
+    {
+      uint8_t  why;
+      int8_t   dir;              /* 必须是 int8_t：Corner_PopEvent 的 dir 是 int8_t* */
+      uint16_t m, cm;
+      int16_t  c_, e_;
+
+      while (Corner_PopEvent(&why, &dir, &m, &cm, &c_, &e_))
+        printf("CORN,%d,%d,%d,%d,%d,%d\r\n",
+               (int)why, (int)dir, (int)m, (int)cm, (int)c_, (int)e_);
+    }
+
+    /* [CW2 2026-11-21] 串口输入 'c'：打印直角弯判据的逐拍记录
+       格式：CW,<序号>,<cnt>,<mask>,<err×10>,<标志>
+       标志 bit0=左侧全亮 bit1=右侧全亮 bit2=丢线
+       用法：跑过一个直角弯（或手推过去）立刻按 'c'，
+       数一下"标志出现 1/2 的那一拍"到"标志出现 4 的第一拍"隔了几拍，
+       那个数就是 CORNER_FULL_HOLD_TICKS 该取的值。 */
+    if (cw_dump_request)
+    {
+      uint8_t n, i;
+
+      cw_dump_request = 0U;
+      n = Cw_LogCount();
+      printf("CWLOG,%d,MATCH=%d,ENTER=%d,BLKARM=%d,BLKCOOL=%d\r\n",
+             (int)n, (int)Cw_FireCount(), (int)Cw_EnterCount(),
+             (int)Cw_BlockArm(), (int)Cw_BlockCool());
+
+      for (i = 0U; i < n; ++i)
+      {
+        int16_t  c_, e_;
+        uint16_t m_;
+        uint8_t  f_;
+
+        Cw_GetAt(i, &c_, &m_, &e_, &f_);
+        printf("CW,%d,%d,%d,%d,%d\r\n", (int)i, (int)c_, (int)m_, (int)e_, (int)f_);
+      }
+
+      Cw_ClearLog();
+    }
+
     if (CAR_DEBUG)
     {
       static uint32_t dbg_last = 0;
@@ -391,20 +440,44 @@ int main(void)
       }
     }
 
-    /* 六边形入口事件 */
+    /* [HEX4 2026-11-21] 六边形事件：中断里入队，这里取空为止。
+       原来用"快照 + 序号"只打最新一条，主循环被 printf 阻塞时（比如按 'c'
+       转储 0.22 s）中间的事件会被压掉；现在不会。 */
     {
-      static uint16_t hex_last_seq = 0;
-      HexDebug hd;
-      Control_GetHexDebug(&hd);
+      uint8_t  code, r, l, c;
+      uint32_t hdist;
+      uint16_t hmask, hseq;
 
-      if (hd.evt_seq != hex_last_seq)
-      {
-        hex_last_seq = hd.evt_seq;
+      while (Hex_PopEvent(&code, &hdist, &hmask, &r, &l, &c, &hseq))
         printf("HEX,%d,%lu,%d,%d,%d,%d,%d\r\n",
-               (int)hd.event, (unsigned long)hd.event_dist,
-               (int)hd.right, (int)hd.left, (int)hd.center,
-               (int)hd.mask, (int)hd.evt_seq);
+               (int)code, (unsigned long)hdist,
+               (int)r, (int)l, (int)c, (int)hmask, (int)hseq);
+    }
+
+    /* [HEX4] 串口 'h'：打印最近 128 拍的 V 判据原始记录
+       格式：HV,<i>,<cnt>,<mask>,<err×10>,<标志>
+       标志 bit0=v_l bit1=v_r bit2=去抖后成立 bit3=正在 DRIVING
+       用途：手推/慢跑一圈六边形，把顶点那几拍的 mask 打出来，
+             重新设计"什么样的 mask 才算一个真 V"。 */
+    if (hexlog_request)
+    {
+      uint8_t n, i;
+
+      hexlog_request = 0U;
+      n = HexLog_Count();
+      printf("HVLOG,%d\r\n", (int)n);
+
+      for (i = 0U; i < n; ++i)
+      {
+        int16_t  c_, e_;
+        uint16_t m_;
+        uint8_t  f_;
+
+        HexLog_GetAt(i, &c_, &m_, &e_, &f_);
+        printf("HV,%d,%d,%d,%d,%d\r\n", (int)i, (int)c_, (int)m_, (int)e_, (int)f_);
       }
+
+      HexLog_Clear();
     }
 
 		
