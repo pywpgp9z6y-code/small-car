@@ -8,6 +8,11 @@
    Hex_Update 每拍刷新（它在 Corner_Update 之前调用）。 */
 static uint8_t hex_zone_flag = 0U;
 
+/* [CW4 2026-11-22] 直角弯"全亮后全丢线"确认状态（Corner_Reset 也要清） */
+static uint8_t  cw_pend;                   /* 1 = 已看到全亮，等丢线确认 */
+static uint16_t cw_pend_wait;              /* 等确认已经过的拍数（超时作废） */
+static uint8_t  corner_gave_up;            /* [LOST3] 直角弯补转 20° 后仍无线 */
+
 /* [CORN 2026-11-15] 锁存瞬间的快照：确认"线在哪一侧"和"转哪个方向"是否一致。
    格式：CORN,<why>,<dir>,<mask>,<cw_mask>,<cnt>,<error×10>
    mask 的 bit i = 通道 i。若把车放在线左侧时 mask 高位亮，说明通道顺序是镜像的。
@@ -96,11 +101,28 @@ void Corner_Reset(CornerState *c)
     c->armed = 1U;          /* [ARM 2026-11-15] 上电/停车后允许锁存 */
     c->arm_cnt = 0U;
     c->settle_ticks = 0U;   /* [SETTLE 2026-11-15] */
+
+    cw_pend      = 0U;      /* [CW4] 丢线确认状态也清 */
+    cw_pend_wait = 0U;
+    corner_gave_up = 0U;    /* [LOST3] 直角弯补转放弃标志 */
 }
 
 uint8_t Corner_IsActive(const CornerState *c)
 {
     return (c->state != 0U) ? 1U : 0U;
+}
+
+/* [LOST3 2026-11-22] 丢线第一拍 Corner_IsActive 还是 0（CW4 要等全丢 2 拍），
+   但 cw_pend 已经在"看到全亮"时置 1 —— control 用这个标志判断"直角弯候选"。 */
+uint8_t Corner_IsPending(void)
+{
+    return (cw_pend != 0U) ? 1U : 0U;
+}
+
+/* [LOST3] 直角弯补转 20° 后仍无线：control 看到就直接 LOST_STOP。 */
+uint8_t Corner_GaveUpNoLine(void)
+{
+    return (corner_gave_up != 0U) ? 1U : 0U;
 }
 
 /* [COOLDOWN 2026-11-18] 出弯冷却改为距离制：走过 CORNER_COOLDOWN_CM 才解禁。
@@ -177,6 +199,8 @@ static void Corner_Enter(CornerState *c, float dir)
     c->armed    = 0U;       /* [ARM 2026-11-15] 出弯后先封闭锁存，等误差稳定再开 */
     c->arm_cnt  = 0U;
     c->settle_ticks = 0U;   /* [SETTLE 2026-11-15] */
+
+    corner_gave_up = 0U;    /* [LOST3] 新弯开始，清掉上一次的"补转放弃" */
     c->recover_dir = 0.0f;  /* [RECOVER 2026-11-16] */
     c->recover_ticks = 0U;
     c->arc_ticks = 0U;      /* [ARC 2026-11-18] */
@@ -308,6 +332,50 @@ static volatile uint16_t cw_enter_cnt;     /* [CW2] 真正进了直角弯状态�
 static volatile uint16_t cw_blk_arm;       /* [CW2] 判据满足但没武装，被挡 */
 static volatile uint16_t cw_blk_cool;      /* [CW2] 判据满足但还在出弯冷却，被挡 */
 
+/* [CWDBG 2026-11-22] 直角弯判据事件环：中断只入队，主循环打印。
+   用来一次性看清"丢线沿 -> 候选 -> fire -> 进/被挡"的完整链路。 */
+#define CWDEVT_MAX 16U
+static CwdDebug cwdevt[CWDEVT_MAX];
+static volatile uint8_t cwdevt_head;
+static volatile uint8_t cwdevt_tail;
+
+static void Cwd_Push(uint8_t code, const CornerState *c, int cnt,
+                     uint16_t mask, float error)
+{
+    uint8_t nxt = (uint8_t)((cwdevt_head + 1U) % CWDEVT_MAX);
+    CwdDebug *d;
+
+    if (nxt == cwdevt_tail)
+        return;                     /* 满：丢新事件 */
+
+    d = &cwdevt[cwdevt_head];
+    d->code    = code;
+    d->cnt     = (uint8_t)cnt;
+    d->mask    = mask;
+    d->cw_mask = c->cw_mask;
+    d->low     = (uint8_t)c->cw_low;
+    d->wide    = (uint8_t)c->cw_wide;
+    d->pend    = cw_pend;
+    d->dark    = (uint8_t)c->cw_dark;
+    d->ticks   = c->cw_ticks;
+    d->armed   = c->armed;
+    d->cool    = (uint8_t)Corner_IsCooling(c);
+    d->hz      = hex_zone_flag;
+    d->state   = c->state;
+    d->err10   = (int16_t)(error * 10.0f);
+    cwdevt_head = nxt;
+}
+
+uint8_t Corner_PopDebug(CwdDebug *d)
+{
+    if (cwdevt_tail == cwdevt_head)
+        return 0U;
+
+    *d = cwdevt[cwdevt_tail];
+    cwdevt_tail = (uint8_t)((cwdevt_tail + 1U) % CWDEVT_MAX);
+    return 1U;
+}
+
 static void CwLog_Push(int cnt, uint16_t mask, float error, uint8_t flag)
 {
     if (cw_log_pause != 0U)
@@ -430,6 +498,8 @@ static void Corner_Watch(CornerState *c, uint16_t mask, int cnt, float error,
             c->cw_low   = 0U;
             c->cw_wide  = 0U;
             c->cw_ticks = 0U;
+            cw_pend      = 0U;      /* [CW4] 十字路口也取消等确认 */
+            cw_pend_wait = 0U;
         }
 
         /* 1) 一侧全亮、另一侧没全亮：拐角的"L"形。
@@ -443,7 +513,13 @@ static void Corner_Watch(CornerState *c, uint16_t mask, int cnt, float error,
                 c->cw_wide  = 1U;
                 c->cw_ticks = 0U;
                 c->cw_side  = (full_l != 0U) ? 1.0f : -1.0f;   /* +1 左转 / -1 右转 */
-                if (c->cw_low < 250U) ++c->cw_low;             /* 复用：连续全亮拍数 */
+
+#if (CORNER_CW3_CONFIRM_TICKS > 0)
+                if (cw_pend == 0U)      /* 已挂起等丢线时不再累加，别反复重置计时 */
+#endif
+                {
+                    if (c->cw_low < 250U) ++c->cw_low;         /* 复用：连续全亮拍数 */
+                }
             }
             else
             {
@@ -460,6 +536,29 @@ static void Corner_Watch(CornerState *c, uint16_t mask, int cnt, float error,
         }
 
 #if (CORNER_TRIG_MODE == 1)
+#if (CORNER_CW3_CONFIRM_TICKS > 0)
+        /* [CW4 2026-11-22] 全亮后先挂起，等线完全离开阵列连续
+           CORNER_CW3_CONFIRM_TICKS 拍才真正触发。
+           六边形关口的"宽实心带"线不会丢 -> 等到 HOLD 窗口后作废，不会误触发；
+           真直角弯全亮后线会甩出阵列 -> 只比原来晚 2 拍。 */
+        if (cw_pend != 0U)
+        {
+            if (++cw_pend_wait > CORNER_FULL_HOLD_TICKS)
+            {
+                cw_pend      = 0U;
+                cw_pend_wait = 0U;
+                c->cw_low    = 0U;
+                Cwd_Push(5U, c, cnt, mask, error);      /* [CWDBG] 候选作废 */
+            }
+        }
+        else if (c->cw_low >= CORNER_L_FULL_TICKS)
+        {
+            cw_pend      = 1U;
+            cw_pend_wait = 0U;
+            c->cw_low    = 0U;
+            Cwd_Push(4U, c, cnt, mask, error);          /* [CWDBG] 候选挂起 */
+        }
+#else
         /* [CW3 2026-11-21] 新模式：连续 CORNER_L_FULL_TICKS 拍拍到"一侧全亮"就触发，
            不再等线消失。触发点由几何决定（车头正对拐角那一拍），每个弯一致，
            不像旧模式那样随"什么时候丢线、丢之前采到哪一帧"漂 3~4 拍。 */
@@ -473,6 +572,7 @@ static void Corner_Watch(CornerState *c, uint16_t mask, int cnt, float error,
             ++cw_fire_cnt;
         }
 #endif
+#endif
         return;
     }
 
@@ -480,6 +580,24 @@ static void Corner_Watch(CornerState *c, uint16_t mask, int cnt, float error,
     if (c->cw_dark < 250U) ++c->cw_dark;
     /* 注意：cw_ticks 在这里不再累加 —— 窗口衡量的是"最后一次看到全亮
        距离线消失过了多久"，丢线之后的时间不该算进去。 */
+
+#if (CORNER_TRIG_MODE == 1) && (CORNER_CW3_CONFIRM_TICKS > 0)
+    /* [CW4] 全亮后已经丢线够拍数 -> 确认是直角弯 */
+    if ((cw_pend != 0U) && (c->cw_dark >= CORNER_CW3_CONFIRM_TICKS))
+    {
+        *dir_out    = c->cw_side;
+        *fire       = 1U;
+        Cwd_Push(2U, c, cnt, mask, error);              /* [CWDBG] CW4 fire */
+
+        cw_pend      = 0U;
+        cw_pend_wait = 0U;
+        c->cw_dark   = 0U;
+        c->cw_wide   = 0U;
+        c->cw_ticks  = 0U;
+        ++cw_fire_cnt;
+        return;
+    }
+#endif
 
     /* 3) 最后一条有效线是否居中（用丢线时冻结的 cw_mask 重新算一次） */
     {
@@ -507,6 +625,7 @@ static void Corner_Watch(CornerState *c, uint16_t mask, int cnt, float error,
         {
             *dir_out    = c->cw_side;
             *fire       = 1U;
+            Cwd_Push(2U, c, cnt, mask, error);          /* [CWDBG] 旧路径 fire */
             c->cw_dark  = 0U;
             c->cw_wide  = 0U;
             c->cw_ticks = 0U;
@@ -551,6 +670,15 @@ float Corner_Update(CornerState *c,
                     float speed_meas,
                     float *speed_cmd)
 {
+    /* [CWDBG 2026-11-22] 丢线沿快照：把 CW 的全部内部状态打出来 */
+    {
+        static uint8_t cwdbg_prev_cnt;
+
+        if ((cnt == 0) && (cwdbg_prev_cnt > 0U))
+            Cwd_Push(1U, c, cnt, mask, error);
+        cwdbg_prev_cnt = (uint8_t)cnt;
+    }
+
     /* ---- 段 1：冲弯（[APPROACH 2026-11-14] 新增）
        直行到“总位移 - 刹车区”，只保航向、忽略线 PID。
        一旦让方向环参与，车会在 7 cm 内顺着弯口拐起来，pivot 起点就偏了。 */
@@ -998,15 +1126,17 @@ float Corner_Update(CornerState *c,
             c->state = CORNER_ST_LINE;
             c->cooldown_dist = c->dist + CORNER_COOLDOWN_COUNTS;
             c->ramp_ticks = CORNER_RAMP_TICKS;
+            corner_gave_up = 0U;
             Motor_SetSpeedGains(SPEED_KP_DEFAULT, SPEED_KI_DEFAULT);
             return 0.0f;
         }
 
         if ((ya >= CORNER_RECOVER_DEG) || (c->recover_ticks >= CORNER_RECOVER_TICKS))
         {
-            c->state = CORNER_ST_LINE;        /* 补满 90° 还是没有：放弃，交给丢线保护 */
+            c->state = CORNER_ST_LINE;        /* 补满 20° 还是没有：放弃，交给丢线保护 */
             c->cooldown_dist = c->dist;
             c->ramp_ticks = 0U;
+            corner_gave_up = 1U;              /* [LOST3] control 看到就直接 LOST_STOP */
             Motor_SetSpeedGains(SPEED_KP_DEFAULT, SPEED_KI_DEFAULT);
             return 0.0f;
         }
@@ -1035,6 +1165,7 @@ float Corner_Update(CornerState *c,
             c->state      = CORNER_ST_LINE;
         c->cooldown_dist = c->dist + CORNER_COOLDOWN_COUNTS;
             c->ramp_ticks = CORNER_RAMP_TICKS;
+            corner_gave_up = 0U;
 
             Motor_SetSpeedGains(SPEED_KP_DEFAULT, SPEED_KI_DEFAULT);
             dir_pid.integral = 0.0f;
@@ -1048,6 +1179,7 @@ float Corner_Update(CornerState *c,
             c->state         = CORNER_ST_LINE;
             c->cooldown_dist = c->dist;      /* [COOLDOWN] 不设冷却 */
             c->ramp_ticks    = 0U;
+            corner_gave_up   = 1U;           /* [LOST3] 反向找线 20° 也没线 */
 
             Motor_SetSpeedGains(SPEED_KP_DEFAULT, SPEED_KI_DEFAULT);
             return 0.0f;
@@ -1059,6 +1191,10 @@ float Corner_Update(CornerState *c,
 
     /* ---- 正常巡线 ---- */
     /* [COOLDOWN 2026-11-18] 冷却改成距离制，这里不再递减计数 */
+
+    /* [LOST3] 回到线上就清"补转放弃"标志 */
+    if (cnt > 0)
+        corner_gave_up = 0U;
 
     /* [ARM 2026-11-15] 重新武装：误差连续 CORNER_ARM_TICKS 拍低于锁存阈值，
        才允许下一次锁存。没有这一条，一次没转准就会“再锁存再转”，
@@ -1084,8 +1220,14 @@ float Corner_Update(CornerState *c,
 
         Corner_Watch(c, mask, cnt, error, &cw_dir, &cw_fire, &cw_gave_up);
 
-        if ((cw_fire != 0U) && (Corner_IsCooling(c) == 0U) && (c->armed != 0U))
+        /* [CW5 2026-11-22] 不再要求 c->armed：
+           CW4 已经是"一侧全亮 2 拍 + 全丢线 2 拍"的双重确认，比单靠武装可靠；
+           连续直角弯只隔 ~6.7 cm，15 拍武装窗口根本来不及，第二个弯会被 BLKARM 挡掉
+           （实测 a连续直角弯1：第一个弯后 10~12 拍就到第二个弯的全亮）。
+           armed 只保留给已停用的通用锁存（#if 0），CW 入口不再看它。 */
+        if ((cw_fire != 0U) && (Corner_IsCooling(c) == 0U))
         {
+            Cwd_Push(3U, c, cnt, mask, error);                      /* [CWDBG] 进 corner */
             ++cw_enter_cnt;                                        /* [CW2] 真的进去了 */
             Corner_Log(1U, cw_dir, mask, c->cw_mask, cnt, error);   /* [CORN] 1 = 直角弯检测触发 */
             Corner_Enter(c, cw_dir);
@@ -1094,8 +1236,8 @@ float Corner_Update(CornerState *c,
         }
         else if (cw_fire != 0U)
         {
-            /* [CW2] 判据满足但被挡下：分别计数，便于定位是"没武装"还是"在冷却" */
-            if (c->armed == 0U)             ++cw_blk_arm;
+            /* [CW5] armed 不再参与判断，只统计冷却挡下的次数 */
+            Cwd_Push(6U, c, cnt, mask, error);                      /* [CWDBG] 被冷却挡 */
             if (Corner_IsCooling(c) != 0U)  ++cw_blk_cool;
         }
         else if (cw_gave_up != 0U)
@@ -1163,6 +1305,12 @@ float Corner_Update(CornerState *c,
             if (*speed_cmd > ramp_speed)
                 *speed_cmd = ramp_speed;
         }
+
+        /* [HEX-FAST 2026-11-22] 六边形区间限速：60° 顶点主要靠方向环硬拉，
+           速度越高越容易把线甩出阵列（出口 V 就是这样丢的）。
+           想关掉就把 HEX_ZONE_SPEED_MAX 设成 BASE_SPEED。 */
+        if ((hex_zone_flag != 0U) && (*speed_cmd > HEX_ZONE_SPEED_MAX))
+            *speed_cmd = HEX_ZONE_SPEED_MAX;
     }
 
     return pid_turn;//返回方向环模式
@@ -1458,21 +1606,6 @@ HexOutput Hex_Update(HexState *h,
     return out;
 }
 
-void Hex_GetDebug(const HexState *h, HexDebug *d)
-{
-    d->evt_seq = h->evt_seq;
-    d->event = h->dbg_event;
-    d->event_dist = h->dbg_dist;
-    d->right = h->dbg_right;
-    d->left = h->dbg_left;
-    d->center = h->dbg_center;
-    d->mask = h->dbg_mask;
-    d->event_cnt = h->event_cnt;
-    d->off_r = h->event_cnt;                 /* 复用：0/1/2 */
-    d->off_l = (uint16_t)h->v_active;        /* 复用：1=正在打舵 */
-    d->dist = h->dist;
-    d->arm = (uint16_t)h->v_prev;            /* 复用：上一拍是否 V */
-}
 
 /* ================= [HEX4 2026-11-21] 六边形：两次 V 判据（新写） =================
    按现场描述重写，和老 Hex_Update 的区别：
@@ -1480,7 +1613,10 @@ void Hex_GetDebug(const HexState *h, HexDebug *d)
      新：第一次 V 只"武装"并回正；必须在 10~20 cm 内真的再看到**同侧** V
          且大误差方向一致才进入；出口要累计 350~370° 且遇到 V，再反向打 30°。
    状态：0=IDLE 1=ARMED 2=TURN_IN 3=DRIVING 4=TURN_OUT
-   事件码（打印 HEX,<event>）：4=武装 5=进入 6=进弯转完 8=解除 9=出口 10=出弯转完 */
+   事件码（打印 HEX,<event>）：4=武装 5=进入 6=进弯转完 8=解除 9=出口 10=出弯转完
+                               12=DRIVING 中看到 V（第二字段 = 当前累计角）
+                               13=V1 后的 V（第二字段 = 距 V1 的里程，手推诊断用）
+                               14=异侧 V 否决（HEX4_OPP_VETO=1 时） */
 static uint8_t  hx_state;
 static int8_t   hx_dir;          /* 记录的转向方向：+1 左 / -1 右 */
 static int8_t   hx_err1;         /* V1 时的大误差方向（可能为 0） */
@@ -1488,6 +1624,8 @@ static int8_t   hx_side;         /* 当前 V 的侧别 */
 static uint8_t  hx_vprev;        /* 上一拍有没有 V（算上升沿） */
 static uint8_t  hx_vrun;         /* V 去抖：连续同侧拍数（本文件私有，不动结构体） */
 static int8_t   hx_vrun_side;
+static uint8_t  hx_vl_raw_prev;  /* [V-WIDE 2026-11-22] 上一拍 v_l 原始判据（1 拍展宽用） */
+static uint8_t  hx_vr_raw_prev;  /* [V-WIDE 2026-11-22] 上一拍 v_r 原始判据 */
 static uint32_t hx_v1_dist;      /* V1 的里程 */
 static uint32_t hx_t0;           /* 打舵起始里程 */
 static float    hx_yaw;          /* 本次打舵累计角度 */
@@ -1617,6 +1755,8 @@ void Hex4_Reset(void)
     hx_vprev      = 0U;
     hx_vrun       = 0U;
     hx_vrun_side  = 0;
+    hx_vl_raw_prev = 0U;    /* [V-WIDE] */
+    hx_vr_raw_prev = 0U;
     hx_v1_dist    = 0U;
     hx_t0         = 0U;
     hx_yaw        = 0.0f;
@@ -1624,6 +1764,26 @@ void Hex4_Reset(void)
     hx_straight   = 0U;
     hx_turn_at_v1 = 0.0f;
     hx_seq_last   = 0U;
+}
+
+void Hex_GetDebug(const HexState *h, HexDebug *d)
+{
+    d->evt_seq = h->evt_seq;
+    d->event = h->dbg_event;
+    d->event_dist = h->dbg_dist;
+    d->right = h->dbg_right;
+    d->left = h->dbg_left;
+    d->center = h->dbg_center;
+    d->mask = h->dbg_mask;
+    d->dist = h->dist;
+    d->arm = (uint16_t)h->v_prev;
+
+    /* [HEXDBG 2026-11-22] 前三列原来是 0，现在借用来在线看状态机：
+       event_cnt = hx_state（0..4）、off_r = hx_total（已转角度）、off_l = hx_vrun。
+       串口 HEXSTAT 行可直接看到进没进 DRIVING、累计角到多少、V 去抖计数。 */
+    d->event_cnt = (uint16_t)hx_state;
+    d->off_r     = (uint16_t)hx_total;
+    d->off_l     = (uint16_t)hx_vrun;
 }
 
 HexOutput Hex_Update4(HexState *h,
@@ -1657,6 +1817,8 @@ HexOutput Hex_Update4(HexState *h,
     if ((Corner_IsActive(corner) != 0U) || (Corner_IsCooling(corner) != 0U))
     {
         hex_zone_flag = 0U;
+        hx_vl_raw_prev = 0U;    /* [V-WIDE] 别把过弯前的 V 带到恢复后的第一拍 */
+        hx_vr_raw_prev = 0U;
         return out;
     }
 
@@ -1677,6 +1839,21 @@ HexOutput Hex_Update4(HexState *h,
 
     v_l = (uint8_t)(a_l && c_s && (b_l_n <= HEX_V_B_MAX));
     v_r = (uint8_t)(a_r && c_s && (b_r_n <= HEX_V_B_MAX));
+
+    /* [V-WIDE 2026-11-22] 先做 1 拍展宽，再做 2 拍去抖：
+       六边形顶点在 300 速度下 V 形态实测只持续 1 拍（3184 那一拍），
+       原来直接连续 2 拍去抖会漏掉，状态机一直不武装。
+       这里把"本拍是 V"扩展成"本拍和下一拍都算 V"，正好满足
+       HEX_V_DEBOUNCE=2；2 拍以上的真 V 只是多算 1 拍，不影响。 */
+    {
+        uint8_t vl_w = (uint8_t)(v_l || hx_vl_raw_prev);
+        uint8_t vr_w = (uint8_t)(v_r || hx_vr_raw_prev);
+
+        hx_vl_raw_prev = v_l;
+        hx_vr_raw_prev = v_r;
+        v_l = vl_w;
+        v_r = vr_w;
+    }
 
     s = (int8_t)((v_l != v_r) ? (v_l ? 1 : -1) : 0);
 
@@ -1722,6 +1899,18 @@ HexOutput Hex_Update4(HexState *h,
     rising = (uint8_t)((s != 0) && (hx_vprev == 0U));
     hx_vprev = (uint8_t)((s != 0) ? 1U : 0U);
 
+    /* [V2-DIAG 2026-11-22] V1 之后（ARMED / TURN_IN）每一个 V 都打一条，
+       供手推过关口确认"异侧 V"到底能不能检到、离 V1 多远：
+         HEX,13,<dist_since_v1>,<right>,<left>,<center>,<mask>,<seq>
+       dist_since_v1 单位 counts（435.7 = 1 cm）。
+       看 mask 或 right/left 就能分出同侧/异侧（V1 的侧别看 HEX,4 的 mask）。 */
+    if ((rising != 0U) && ((hx_state == 1U) || (hx_state == 2U)))
+    {
+        h->dbg_event = 13U;
+        h->dbg_dist  = h->dist - hx_v1_dist;
+        ++h->evt_seq;
+    }
+
     if (s != 0) hx_side = s;
 
     /* 大误差方向：error>0 表示线在右 -> 应该右转 -> -1 */
@@ -1756,6 +1945,23 @@ HexOutput Hex_Update4(HexState *h,
         break;
 
     case 1U:    /* ARMED：先回正，然后按 HEX4_NEED_V2 决定怎么进 */
+#if (HEX4_OPP_VETO == 1)
+        /* [V2 2026-11-22] 异侧否决：V1 后距离窗口内出现异侧 V -> 取消进入。
+           双六边形 / 17 号那种"V1 和 V2 反着来"的位置，靠这一条挡住。
+           窗口用独立的 HEX4_OPP_MIN/MAX（手推实测异侧 V 在 4.6 cm，
+           比 V2 的 6 cm 下限更近，不能共用）。 */
+        if ((rising != 0U) && (s != 0) && (s != hx_dir) &&
+            ((h->dist - hx_v1_dist) >= HEX4_OPP_MIN_COUNTS) &&
+            ((h->dist - hx_v1_dist) <= HEX4_OPP_MAX_COUNTS))
+        {
+            hx_state = 0U;
+
+            h->dbg_event = 14U;                 /* 14 = 异侧 V 否决 */
+            h->dbg_dist  = h->dist - hx_v1_dist;
+            ++h->evt_seq;
+            break;
+        }
+#endif
         if (hx_straight > 0U)
         {
             --hx_straight;
@@ -1854,7 +2060,22 @@ HexOutput Hex_Update4(HexState *h,
         break;
 
     case 3U:    /* DRIVING：交回方向环，只累计角度 */
-        if (rising &&
+        /* [HEXDBG 2026-11-22] DRIVING 里每见到一个 V 就记下当前累计角：
+           HEX,12,<total>,...  —— 用来看出口 V 到底落在多少度。
+           如果一直只有 12 没有 9，就对一下 total 是否落在
+           [HEX4_EXIT_MIN_DEG, HEX4_EXIT_MAX_DEG] 里。 */
+        if (rising)
+        {
+            h->dbg_event = 12U;
+            h->dbg_dist  = (uint32_t)hx_total;
+            ++h->evt_seq;
+        }
+
+        /* [FIX 2026-11-22] 出口判据从"上升沿落在窗口内"改成"V 电平在窗口内"：
+           出口 V 经常在 318° 起、321° 就结束；上一拍 rising 在窗口外，
+           这一拍已经不是上升沿，会整个漏掉。改成电平判断后，只要 V 持续
+           期间累计角进过窗口就能出。 */
+        if ((s != 0) &&
             (hx_total >= HEX4_EXIT_MIN_DEG) && (hx_total <= HEX4_EXIT_MAX_DEG))
         {
             hx_state = 4U;                      /* TURN_OUT */

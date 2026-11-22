@@ -306,7 +306,17 @@ int main(void)
   {
     printf("CCR1,CCR2,tgtLx10,tgtRx10,dL,dR,speedL,speedR\r\n");
     printf("HEX,event,dist,right,left,center,mask,seq\r\n");
-    printf("HEXSTAT,event,offR,offL,right,left,center,dist,arm\r\n");
+    printf("HEXSTAT,state,total,vrun,right,left,center,dist,arm,mask\r\n");
+    /* [CWDBG 2026-11-22] 直角弯判据事件 */
+    printf("CWD,code,cnt,mask,cw_mask,low,wide,pend,dark,ticks,armed,cool,hz,state,err10\r\n");
+    /* [LOSS-FEAT 2026-11-22] 丢线窗口特征 */
+    printf("LF,err10,slope,sign,edge,center,side,full\r\n");
+    /* [HEXCFG 2026-11-22] 上电打印实际编译进去的六边形参数，
+       用来确认烧的是不是新代码（HEX,9 不出时先看这一行）。 */
+    printf("HEXCFG,MIN=%d,MAX=%d,GIVEUP=%d,DRIVE=%d,SPEED=%d\r\n",
+           (int)HEX4_EXIT_MIN_DEG, (int)HEX4_EXIT_MAX_DEG,
+           (int)HEX4_EXIT_GIVEUP_DEG, (int)HEX4_DRIVE_MAX_CM,
+           (int)HEX_ZONE_SPEED_MAX);
   }
 
   pid_L.target = BASE_SPEED ;          // 脉冲/10ms；必须和方向环用同一个常量
@@ -454,9 +464,47 @@ int main(void)
                (int)r, (int)l, (int)c, (int)hmask, (int)hseq);
     }
 
-    /* [HEX4] 串口 'h'：打印最近 128 拍的 V 判据原始记录
+    /* [LOSTDBG 2026-11-22] 丢线沿：拿丢线前一拍的 error/mask。
+       手推 45°/60°/断路口各一次，看 LOST,<err×10>,... 就能定 LOST_BEND_ERR。 */
+    {
+      int16_t  le;
+      uint16_t lm;
+      int16_t  lsl, lsr;
+      uint8_t  lc;
+
+      if (Control_PopLostLine(&le, &lm, &lsl, &lsr, &lc))
+        printf("LOST,%d,%d,%d,%d,%d\r\n",
+               (int)le, (int)lm, (int)lsl, (int)lsr, (int)lc);
+    }
+
+    /* [LOSS-FEAT 2026-11-22] 丢线沿的 16 拍窗口特征（只观察）：
+       err10, slope(centi-lane/拍), 同号%, 贴边拍数, 居中拍数, 最大侧向连续路数, 全亮 */
+    {
+      int16_t fe, fs;
+      uint8_t fg, fedge, fcenter, fside, ffull;
+
+      if (Control_PopLossFeat(&fe, &fs, &fg, &fedge, &fcenter, &fside, &ffull))
+        printf("LF,%d,%d,%d,%d,%d,%d,%d\r\n",
+               (int)fe, (int)fs, (int)fg,
+               (int)fedge, (int)fcenter, (int)fside, (int)ffull);
+    }
+
+    /* [CWDBG 2026-11-22] 直角弯判据事件：丢线沿 / 候选 / fire / 进 corner / 被挡 */
+    {
+      CwdDebug cd;
+
+      while (Corner_PopDebug(&cd))
+        printf("CWD,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\r\n",
+               (int)cd.code, (int)cd.cnt, (int)cd.mask, (int)cd.cw_mask,
+               (int)cd.low, (int)cd.wide, (int)cd.pend, (int)cd.dark,
+               (int)cd.ticks, (int)cd.armed, (int)cd.cool, (int)cd.hz,
+               (int)cd.state, (int)cd.err10);
+    }
+
+    /* [HEX4] 串口 'h'：打印最近 128 拍的 V 判据记录
        格式：HV,<i>,<cnt>,<mask>,<err×10>,<标志>
-       标志 bit0=v_l bit1=v_r bit2=去抖后成立 bit3=正在 DRIVING
+       标志 bit0=v_l bit1=v_r（[V-WIDE 2026-11-22] 已做 1 拍展宽）
+            bit2=去抖后成立 bit3=正在 DRIVING
        用途：手推/慢跑一圈六边形，把顶点那几拍的 mask 打出来，
              重新设计"什么样的 mask 才算一个真 V"。 */
     if (hexlog_request)
@@ -491,8 +539,10 @@ int main(void)
         HexDebug hd;
         Control_GetHexDebug(&hd);
 
-        /* [HEX-V 2026-11-15] 末尾追加 mask：12 路原始掩码，用来复盘 V 型判据
-           （追加在最后，前面 8 列位置不变，旧解析脚本不受影响） */
+        /* [HEX-V 2026-11-15] 末尾追加 mask：12 路原始掩码，用来复盘 V 型判据。
+           [HEXDBG 2026-11-22] 前三列改成在线状态：
+             state = hx_state（0..4）、total = hx_total 累计角、vrun = V 去抖计数。
+           末尾 mask 位置不变，旧解析脚本仍可读。 */
         printf("HEXSTAT,%d,%d,%d,%d,%d,%d,%lu,%d,%d\r\n",
                (int)hd.event_cnt, (int)hd.off_r, (int)hd.off_l,
                (int)hd.right, (int)hd.left, (int)hd.center,

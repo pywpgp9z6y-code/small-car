@@ -64,6 +64,19 @@ typedef struct {
     uint8_t  arc_line_ticks; /* [ARC 2026-11-18] 出弯后连续看到线的拍数 */
 } CornerState;
 
+/* [CWDBG 2026-11-22] 直角弯判据的一次性事件快照（中断入队，主循环打印） */
+typedef struct {
+    uint8_t  code;       /* 1=丢线沿 2=CW fire 3=进corner 4=候选挂起 5=候选作废 6=被冷却挡 */
+    uint8_t  cnt;
+    uint16_t mask;
+    uint16_t cw_mask;
+    uint8_t  low, wide, pend, dark, armed, cool, hz, state;
+    uint16_t ticks;
+    int16_t  err10;
+} CwdDebug;
+
+uint8_t Corner_PopDebug(CwdDebug *d);
+
 /* 六边形入口状态 */
 typedef struct {
     uint8_t  v_prev;         /* [HEX-V 2026-11-15] 上一拍是否处于"严" V 型（武装边沿） */
@@ -118,6 +131,13 @@ typedef struct {
 void Corner_Reset(CornerState *c);
 uint8_t Corner_IsActive(const CornerState *c);
 uint8_t Corner_IsCooling(const CornerState *c);   /* [COOLDOWN 2026-11-18] 1 = 还在出弯冷却期 */
+
+/* [LOST3 2026-11-22] 直角弯候选：CW4 已看到"一侧全亮"并挂起等丢线确认。
+   丢线第一拍 Corner_IsActive 还是 0，control 靠这个标志先让 corner 接管。 */
+uint8_t Corner_IsPending(void);
+/* [LOST3 2026-11-22] 直角弯补转 20° 后仍无线：control 看到就直接走 LOST_STOP，
+   不再落到 45/60 的 HOLD / 90° 补转。 */
+uint8_t Corner_GaveUpNoLine(void);
 void Corner_AddDistance(CornerState *c, uint32_t counts);   /* [APPROACH 2026-11-14] */
 
 /* [CW2 2026-11-21] 直角弯判据的逐拍记录（串口 'c' 打印）：

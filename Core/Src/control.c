@@ -48,6 +48,9 @@ static float   rec2_yaw;           /* [RECOVER2] 丢线后累计转角（HOLD �
 static float   rec2_dir;           /* [RECOVER2] 补转方向：由丢线前一拍的 error 符号定 */
 static uint8_t rec2_armed;         /* [RECOVER2] 1 = 丢线前 |error| 够大，允许补转 */
 static uint8_t rec2_pivot;         /* [RECOVER2] 1 = 本拍正在原地补转（速度环前馈按 pivot 给） */
+static uint8_t hold_armed;         /* [HEXHOLD 2026-11-22] 大误差丢线，允许 HOLD（六边形区间也生效） */
+static uint8_t hex_boost_ticks;    /* [HEXBOOST] 允许内轮反转的剩余拍数 */
+static uint8_t hex_boost_gap;      /* [HEXBOOST] 窗口结束后的冷却拍数 */
 
 /* [BLIND 2026-11-18] 断线区斜穿状态 */
 static uint8_t  blind_phase;       /* 0=关 1=转向到目标角 2=保持航向直行 */
@@ -56,6 +59,7 @@ static float    blind_yaw;         /* 已转过的角度，° */
 static uint32_t blind_dist;        /* 已走过的 counts */
 static uint8_t  blind_seen;        /* 连续看到线的拍数（退出用迟滞） */
 static uint16_t blind_tick;        /* 本阶段计时（超时兜底） */
+static float    blind_speed;       /* [BLIND 2026-11-22] 直行段当前速度（爬坡用） */
 
 /* ---- 编码器 ---- */
 static int16_t last_L = 0, last_R = 0;
@@ -64,6 +68,33 @@ static int16_t last_valid_dL = 0, last_valid_dR = 0;
 /* ---- 调试快照：中断写、主循环读，只做显示用 ---- */
 static volatile int16_t dbg_dL = 0, dbg_dR = 0;
 static volatile float   dbg_speed_L = 0.0f, dbg_speed_R = 0.0f;
+
+/* [LOSTDBG 2026-11-22] 丢线沿检测：记录"丢线前一拍"的 error/mask，
+   主循环取一次打印 LOST,<err×10>,<mask>,<spdL>,<spdR>,<corner>。
+   用途：手推 45°/60° 弯和断路口，量丢线前 error，定 LOST_BEND_ERR。 */
+static uint8_t  lost_prev_cnt;
+static int16_t  lost_last_err10;
+static uint16_t lost_last_mask;
+static volatile uint8_t  lost_evt;
+static volatile int16_t  lost_evt_err10;
+static volatile uint16_t lost_evt_mask;
+static volatile int16_t  lost_evt_sl, lost_evt_sr;
+static volatile uint8_t  lost_evt_corner;
+
+/* [LOSS-FEAT 2026-11-22] 丢线前 16 拍误差/掩码窗口（只观察，不改控制）。
+   在丢线沿算：误差斜率、同号比例、贴边拍数、居中拍数、最大侧向连续路数、是否全亮。 */
+#define LOSS_WIN  16U
+static int16_t  lf_err[LOSS_WIN];    /* error ×100（centi-lane） */
+static uint8_t  lf_cnt[LOSS_WIN];
+static uint16_t lf_mask[LOSS_WIN];
+static volatile uint8_t lf_evt;
+static volatile int16_t lf_err0_10;  /* 最后一条有效线 error×10 */
+static volatile int16_t lf_slope;    /* 窗口斜率：centi-lane / 拍 */
+static volatile uint8_t lf_sign;     /* 同号比例 0..100 */
+static volatile uint8_t lf_edge;     /* |err|>3 的拍数 */
+static volatile uint8_t lf_center;   /* |err|<2 的拍数 */
+static volatile uint8_t lf_side;     /* 一侧最大连续亮路数 0..6 */
+static volatile uint8_t lf_full;     /* 1 = 出现过一侧 6 路全亮 */
 
 /* ================= 停车 / 发车 ================= */
 
@@ -283,6 +314,26 @@ static void Straight_Update(void)
 /* ================= 方向环 ================= */
 
 /* 返回 1 = 本拍已丢线停车，Control_Update 必须立刻退出（等价于原来的 return）。 */
+/* [LOSS-FEAT] 一侧 6 路里的最大连续亮路数 */
+static uint8_t MaskRun(uint16_t m, uint8_t start)
+{
+    uint8_t best = 0U, cur = 0U, k;
+
+    for (k = 0U; k < 6U; ++k)
+    {
+        if ((m & (uint16_t)(1U << (start + k))) != 0U)
+        {
+            if (++cur > best) best = cur;
+        }
+        else
+        {
+            cur = 0U;
+        }
+    }
+
+    return best;
+}
+
 static uint8_t Control_Direction(void)
 {
     LineSample line;
@@ -308,6 +359,109 @@ static uint8_t Control_Direction(void)
     /* 1) 12 路 -> 偏差 */
     Sensor_Scan(&line);
 
+    /* [LOSS-FEAT] 更新 16 拍窗口（含当前拍；丢线拍 cnt=0 也会进窗口） */
+    {
+        uint8_t i;
+
+        for (i = 0U; i < (LOSS_WIN - 1U); ++i)
+        {
+            lf_err[i]  = lf_err[i + 1U];
+            lf_cnt[i]  = lf_cnt[i + 1U];
+            lf_mask[i] = lf_mask[i + 1U];
+        }
+        lf_err[LOSS_WIN - 1U]  = (int16_t)(line.error * 100.0f);
+        lf_cnt[LOSS_WIN - 1U]  = line.cnt;
+        lf_mask[LOSS_WIN - 1U] = line.mask;
+    }
+
+    /* [LOSTDBG 2026-11-22] 丢线沿：把最后一条有效线的 error/mask 存下来，
+       在 cnt 0 的那一拍给主循环一个一次性事件。 */
+    if (line.cnt > 0U)
+    {
+        lost_last_err10 = (int16_t)(line.error * 10.0f);
+        lost_last_mask  = line.mask;
+    }
+    else if (lost_prev_cnt > 0U)
+    {
+        lost_evt_err10  = lost_last_err10;
+        lost_evt_mask   = lost_last_mask;
+        lost_evt_sl     = (int16_t)dbg_speed_L;
+        lost_evt_sr     = (int16_t)dbg_speed_R;
+        lost_evt_corner = Corner_IsActive(&corner);
+        lost_evt        = 1U;
+
+        /* [LOSS-FEAT] 在 16 拍窗口里算特征（只观察） */
+        {
+            int8_t  k;
+            int8_t  first = -1;
+            int8_t  last  = -1;
+            uint8_t edge = 0U, center = 0U, side = 0U, full = 0U;
+            uint8_t same = 0U, pairs = 0U;
+            int16_t slope = 0;
+            int16_t err0_10 = 0;
+
+            for (k = 0; k < (int8_t)LOSS_WIN; ++k)
+            {
+                if (lf_cnt[k] > 0U)
+                {
+                    if (first < 0) first = k;
+                    last = k;
+                }
+            }
+
+            if ((first >= 0) && (last > first))
+            {
+                int16_t span = (int16_t)(last - first);
+                int16_t e0 = lf_err[last];
+                int16_t e1 = lf_err[first];
+                int16_t dir = (e0 >= e1) ? 1 : -1;
+
+                err0_10 = (int16_t)(e0 / 10);
+
+                for (k = first; k <= last; ++k)
+                {
+                    int16_t ae;
+                    uint8_t r0, r1;
+
+                    if (lf_cnt[k] == 0U)
+                        continue;
+
+                    ae = (lf_err[k] >= 0) ? lf_err[k] : -lf_err[k];
+                    if (ae > 300) ++edge;
+                    if (ae < 200) ++center;
+
+                    r0 = MaskRun(lf_mask[k], 0U);
+                    r1 = MaskRun(lf_mask[k], 6U);
+                    if (r0 > side) side = r0;
+                    if (r1 > side) side = r1;
+
+                    if (k > first)
+                    {
+                        int16_t d = lf_err[k] - lf_err[k - 1];
+                        if (d != 0)
+                        {
+                            ++pairs;
+                            if ((d > 0) == (dir > 0)) ++same;
+                        }
+                    }
+                }
+
+                slope = (int16_t)((e0 - e1) / span);
+                if (side >= 6U) full = 1U;
+            }
+
+            lf_err0_10 = err0_10;
+            lf_slope   = slope;
+            lf_sign    = (pairs > 0U) ? (uint8_t)((same * 100U) / pairs) : 0U;
+            lf_edge    = edge;
+            lf_center  = center;
+            lf_side    = side;
+            lf_full    = full;
+            lf_evt     = 1U;
+        }
+    }
+    lost_prev_cnt = line.cnt;
+
     /* 2) 方向环：先算出来交给 special 决定是否锁存 */
     if (line.cnt > 0U)//T:没丢线才上方向环？
     {
@@ -319,8 +473,8 @@ static uint8_t Control_Direction(void)
             float v;
             float d;
             float turn_ff;
-            float omega_des;
             float err_d;
+            uint8_t hz = Hex_ZoneActive();      /* [HEX-FAST] 1 = 六边形区间 */
 
             err_f += ERR_FILTER_ALPHA * (line.error - err_f);   /* 量化低通 */
 
@@ -336,7 +490,7 @@ static uint8_t Control_Direction(void)
             v = car.speed_cmd;                  /* 上一拍的速度目标，够用 */
             if (v < 30.0f) v = 30.0f;           /* 防止低速时映射爆炸 */
 
-            d = (Hex_ZoneActive() != 0U) ? PURSUIT_L_CM_HEX : PURSUIT_L_CM;
+            d = (hz != 0U) ? PURSUIT_L_CM_HEX : PURSUIT_L_CM;
 
             /* [SPEED300 2026-11-21] 只在"大误差"时收短前视，其余情况保持 10 cm。
                固定 10 cm 时 G = 13.3×300/100 = 40，直道是"有力气"的；
@@ -345,25 +499,30 @@ static uint8_t Control_Direction(void)
                弯里需要更大权限：几何上 d 处最多只能报出 3.3 cm 侧偏，
                可表达的最小半径 R = d²/(2×3.3)：d=10 时 R≥15 cm，跑不了 45°；
                d=8 时 R_min=9.7 cm，G=62。所以 |err|>CORNER_NEAR_ERR 才切短。
-               回差（2.0 进 / 1.2 出）避免 G 在门限附近 40↔62 来回跳。 */
+               回差（2.0 进 / 1.2 出）避免 G 在门限附近 40↔62 来回跳。
+               [HEX-FAST 2026-11-22] 六边形区间用更短的 HEX_NEAR（6 cm），
+               60° 顶点能表达出更小的转弯半径。 */
             if ((err_f > CORNER_NEAR_ERR) || (err_f < -CORNER_NEAR_ERR))
                 near_d = 1U;
             else if ((err_f < CORNER_NEAR_ERR * 0.6f) && (err_f > -CORNER_NEAR_ERR * 0.6f))
                 near_d = 0U;
 
             if (near_d != 0U)
-                d = PURSUIT_L_CM_NEAR;
+                d = (hz != 0U) ? PURSUIT_L_CM_HEX_NEAR : PURSUIT_L_CM_NEAR;
 
             /* [KINEMA 2026-11-18] 符号约定：error = bias - 5.5，error>0 表示线在右侧，
                车应该右转（turn < 0）。所以这里必须带负号——漏掉负号会变成正反馈，
                车会越偏越往外打舵、直接乱转（新方案错误1 就是这个）。 */
             turn_ff   = -CURVE_K * v * err_d / (d * d);  /* 期望差速（含微分阻尼） */
-            omega_des = turn_ff * OMEGA_PER_TURN;        /* 期望角速度 °/s（右转为负） */
 
             /* [ARC 2026-11-18] 纯阻尼：只做速率反馈，不再用 K·(ω_des−ω)。
                原来那形式里 +K·ω_des 与 turn_ff 同号，会把位置增益从 16 放大到 29，
-               正是直道高速抖动的来源。 */
-            pid_turn = turn_ff - DAMP_K * Gyro_GetZ();
+               正是直道高速抖动的来源。
+               [HEX-FAST 2026-11-22] 六边形区间阻尼减半（0.4 -> 0.2）：
+               60° 顶点时车正在快速旋转，阻尼太大会把刚打起来的舵又收回去。
+               [BEND 2026-11-22] 普通大误差（45° 弯）用 0.25，介于两者之间。 */
+            pid_turn = turn_ff - ((hz != 0U) ? DAMP_K_HEX :
+                                  ((near_d != 0U) ? BEND_DAMP_K : DAMP_K)) * Gyro_GetZ();
         }
 #else
         pid_turn = DirPID_Calc(&dir_pid, line.error);
@@ -377,13 +536,50 @@ static uint8_t Control_Direction(void)
         pid_turn -= DIR_DAMP * Gyro_GetZ();
 #endif
 
-        if (pid_turn >  TURN_MAX) pid_turn =  TURN_MAX;
-        if (pid_turn < -TURN_MAX) pid_turn = -TURN_MAX;
+        /* [HEX-FAST 2026-11-22] 六边形区间单独一套限幅/斜率：
+           TURN_MAX 250 -> 280、TURN_SLEW 20 -> 60。
+           60° 顶点只有 ~10 拍可用，20/拍的斜率要 12.5 拍才打满，
+           等打满车已经冲过顶点，线滑出阵列 -> 出口 V 形成不了。 */
+        {
+            float tmax = (Hex_ZoneActive() != 0U) ? TURN_MAX_HEX :
+                         ((near_d != 0U) ? BEND_TURN_MAX : TURN_MAX);
+            float slew = (Hex_ZoneActive() != 0U) ? TURN_SLEW_HEX :
+                         ((near_d != 0U) ? BEND_TURN_SLEW : TURN_SLEW);
 
-        /* [SLEW 2026-11-16] 转向限斜率：每拍最多变 TURN_SLEW，削掉阶跃 */
-        if (pid_turn > turn_prev + TURN_SLEW) pid_turn = turn_prev + TURN_SLEW;
-        if (pid_turn < turn_prev - TURN_SLEW) pid_turn = turn_prev - TURN_SLEW;
-        turn_prev = pid_turn;
+            /* [HEXBOOST 2026-11-22] 六边形里 |error| 大时开一个短窗口：
+               允许内轮反转（最多 -HEX_BOOST_INNER），turn 上限提到 speed+80。
+               60° 顶点需要 ~380，内轮 0 时只有 speed；窗口 12 拍，之后冷却 8 拍。 */
+            if (Hex_ZoneActive() != 0U)
+            {
+                if (hex_boost_ticks > 0U)
+                    --hex_boost_ticks;
+                else if (hex_boost_gap > 0U)
+                    --hex_boost_gap;
+                else if ((line.error > HEX_BOOST_ERR) || (line.error < -HEX_BOOST_ERR))
+                {
+                    hex_boost_ticks = HEX_BOOST_TICKS;
+                    hex_boost_gap   = HEX_BOOST_GAP_TICKS;
+                }
+            }
+            else
+            {
+                hex_boost_ticks = 0U;
+                hex_boost_gap   = 0U;
+            }
+
+            if (hex_boost_ticks > 0U)
+            {
+                float bt = car.speed_cmd + HEX_BOOST_INNER;
+                if (bt > tmax) tmax = bt;
+            }
+
+            if (pid_turn >  tmax) pid_turn =  tmax;
+            if (pid_turn < -tmax) pid_turn = -tmax;
+
+            if (pid_turn > turn_prev + slew) pid_turn = turn_prev + slew;
+            if (pid_turn < turn_prev - slew) pid_turn = turn_prev - slew;
+            turn_prev = pid_turn;
+        }
     }
 
     /* 3) 丢线保护：过弯锁存期间/斜穿期间不因线暂时消失而停 */
@@ -433,6 +629,13 @@ static uint8_t Control_Direction(void)
                     Corner_IsActive(&corner)) ? 1U : 0U;
     car.speed_cmd = speed_local;
 
+    /* [BEND 2026-11-22] 45° 弯里限速：near_d 且不在六边形/过弯状态。
+       260 下 45° 需要 ~411°/s，turn 300（外轮 600、内轮 0）够用且留余量。 */
+    if ((near_d != 0U) && (Hex_ZoneActive() == 0U) &&
+        (Corner_IsActive(&corner) == 0U) &&
+        (car.speed_cmd > BEND_SPEED_MAX))
+        car.speed_cmd = BEND_SPEED_MAX;
+
     /* 六边形满舵覆盖通用过弯。
        [APPROACH 2026-11-14] 过弯四段期间不允许 hex 抢控制权，
        否则冲弯/刹车会被 15 拍的满舵覆盖打断。
@@ -455,15 +658,15 @@ static uint8_t Control_Direction(void)
     {
         if (blind_phase == 0U)
         {
-            /* [HOLD 2026-11-21] 等"丢线保持转向"用完之后再启动盲穿。
-               否则 HOLD 只跑 BLIND_START_TICKS(5) 拍就被盲穿抢走，
-               60° 弯需要 ~15 拍，根本来不及。
-               [BLIND-GATE 2026-11-21] 再加一条：丢线前误差必须 <= 1 路。
-               盲穿是给"线断了/有个缺口"用的——那时车基本是正对着线。
-               如果丢线前误差已经很大，说明是弯而不是断线，这时不该盲目直穿。 */
+            /* [LOST3 2026-11-22] 按三分支重排：
+               ① 直角弯候选（CW pending）-> control 不抢，交给 corner；
+               ② 大误差（>=LOST_BEND_ERR）-> HOLD + 90° 同向补转；
+               ③ 小误差 -> 盲穿，直接启动，不等 HOLD。
+               下面只启动③；①② 在后面的 HOLD 块里。 */
             if ((line.cnt == 0U) && (car.lost_cnt >= BLIND_START_TICKS) &&
-                (line_hold_ticks >= LINE_HOLD_TICKS) && (rec2_done != 0U) &&
-                (err_f <  BLIND_MAX_ABS_ERR) && (err_f > -BLIND_MAX_ABS_ERR))
+                (rec2_armed == 0U) &&
+                (Corner_IsPending() == 0U) &&
+                (Corner_GaveUpNoLine() == 0U))
             {
                 blind_phase = 1U;
                 blind_dir   = BLIND_DIR_FIXED;   /* [BLIND] 方向固定，不看丢线前的误差 */
@@ -471,6 +674,7 @@ static uint8_t Control_Direction(void)
                 blind_dist  = 0U;
                 blind_seen  = 0U;
                 blind_tick  = 0U;
+                blind_speed = BLIND_TURN_SPEED;  /* [BLIND] 直行段从这里开始爬 */
                 /* [ISR-SAFE 2026-11-21] 这条也在中断里：一行 ~20 字符 = 1.7 ms，
                    超过 1 ms 节拍。盲穿启动本身只需要一个标志，不需要当场打印。
                    要观察就改成"写快照 + 主循环打印"，别直接放开下面这行。 */
@@ -523,8 +727,15 @@ static uint8_t Control_Direction(void)
                 {
                     float e = (blind_dir * BLIND_ANGLE_DEG) - blind_yaw;
 
+                    /* [BLIND 2026-11-22] 速度从 45 爬到 500，避免阶跃"蹦一下" */
+                    if (blind_speed < BLIND_SPEED)
+                    {
+                        blind_speed += BLIND_ACCEL;
+                        if (blind_speed > BLIND_SPEED) blind_speed = BLIND_SPEED;
+                    }
+
                     turn          = BLIND_K_YAW * e;
-                    car.speed_cmd = BLIND_SPEED;
+                    car.speed_cmd = blind_speed;
 
                     if ((blind_dist >= BLIND_DIST_COUNTS) || (blind_tick >= BLIND_RUN_MAX_TICKS))
                         blind_phase = 0U;                       /* 走完还没找到：放弃，交给丢线停车 */
@@ -551,6 +762,7 @@ static uint8_t Control_Direction(void)
     {
         rec2_armed = 0U;
         rec2_done  = 1U;
+        hold_armed = 0U;
     }
 
     if (line.cnt > 0U)
@@ -566,15 +778,37 @@ static uint8_t Control_Direction(void)
            资格 = 丢线前一拍 |error| 够大（是弯，不是断线缺口）+ 陀螺可用
                 + 不在六边形区间 + 不在过弯状态机里。 */
         rec2_dir   = (line.error > 0.0f) ? -1.0f : 1.0f;
-        rec2_armed = ((ae >= RECOVER2_ERR_MIN) &&
+        /* [LOST3 2026-11-22] 大/小分界改用 LOST_BEND_ERR(2.0)：
+           手推实测断路 0.5 路，45°/60° 3.5~5.5 路。 */
+        rec2_armed = ((ae >= LOST_BEND_ERR) &&
                       (Gyro_IsOk() != 0U) &&
                       (Hex_ZoneActive() == 0U) &&
-                      (Corner_IsActive(&corner) == 0U)) ? 1U : 0U;
-        /* 不满足资格就不补转：行为退回"HOLD + 盲穿"（和原来一样） */
+                      (Corner_IsActive(&corner) == 0U) &&
+                      (Corner_IsPending() == 0U)) ? 1U : 0U;
+        /* 不满足资格就不补转：小误差走盲穿 */
         rec2_done  = (rec2_armed != 0U) ? 0U : 1U;
+
+        /* [HEXHOLD 2026-11-22] 六边形区间里丢线也要 HOLD：
+           大误差 -> 保持最后一拍舵并继续加舵 16 拍；但不做 90° 补转
+           （rec2_armed 仍排除 hex，避免在六边形里原地转 90°）。 */
+        hold_armed = ((ae >= LOST_BEND_ERR) &&
+                      (Gyro_IsOk() != 0U) &&
+                      (Corner_IsActive(&corner) == 0U)) ? 1U : 0U;
     }
-    else if ((Corner_IsActive(&corner) == 0U) && (blind_phase == 0U))
+    else if ((Corner_IsActive(&corner) == 0U) && (blind_phase == 0U) &&
+             (Corner_GaveUpNoLine() == 0U) && (hex_pivot_active == 0U))
     {
+        /* [LOST3] ① 直角弯候选：丢线第一拍 Corner_IsActive 还是 0，
+           但 CW 已看到全亮（pending）。先保持最后一拍舵，等 CW 在 2 拍内确认，
+           不要抢跑 ②/③。 */
+        if (Corner_IsPending() != 0U)
+        {
+            turn          = line_hold_turn;
+            car.speed_cmd = BASE_SPEED * LINE_HOLD_SPEED_K;
+            have_control  = 1U;
+        }
+        else if (hold_armed != 0U)
+        {
         /* [RECOVER2] 转角从"丢线那一刻"开始累计（HOLD 段也算在内），
            所以 RECOVER2_DEG(90°) 是总补转角，不是只算原地转那一段。 */
         if ((rec2_armed != 0U) && (Gyro_IsOk() != 0U))
@@ -625,6 +859,7 @@ static uint8_t Control_Direction(void)
                 have_control  = 1U;
             }
         }
+        }
     }
 
     /* 5) 差速 -> 左右目标速度（过弯/正常统一在这里写） */
@@ -633,7 +868,8 @@ static uint8_t Control_Direction(void)
            speed_cmd，否则内轮目标为负 -> 电机反接制动（电流数倍、驱动易烧）。
            pivot/原地转走的是另一条路（target 允许为负），所以这里要排除。 */
         if ((!corner_was_active) && (!Corner_IsActive(&corner)) &&
-            (car.spin.mode == 0U) && (hex_pivot_active == 0U) && (rec2_pivot == 0U))
+            (car.spin.mode == 0U) && (hex_pivot_active == 0U) && (rec2_pivot == 0U) &&
+            (hex_boost_ticks == 0U))
         {
             if (turn >  car.speed_cmd) turn =  car.speed_cmd;
             if (turn < -car.speed_cmd) turn = -car.speed_cmd;
@@ -671,7 +907,7 @@ static uint8_t Control_Direction(void)
             }
         }
 #endif
-				if (!corner_was_active && !Corner_IsActive(&corner) && (rec2_pivot == 0U)) {   /* [PIVOT 2026-11-14] 锁存期允许一侧目标为负（两轮反向） */
+				if (!corner_was_active && !Corner_IsActive(&corner) && (rec2_pivot == 0U) && (hex_boost_ticks == 0U)) {   /* [PIVOT 2026-11-14] 锁存期允许一侧目标为负（两轮反向） */
         if (pid_L.target < 0.0f) pid_L.target = 0.0f;
         if (pid_R.target < 0.0f) pid_R.target = 0.0f;
 			}
@@ -964,4 +1200,46 @@ void Control_GetDebug(ControlDebug *d)
 void Control_GetHexDebug(HexDebug *d)
 {
     Hex_GetDebug(&hex, d);
+}
+
+/* [LOSTDBG 2026-11-22] 主循环取"刚丢线"的一次性快照。
+   返回 1 = 有新事件；*err10 / *mask 是丢线前一拍（最后一条有效线）的值。 */
+uint8_t Control_PopLostLine(int16_t *err10, uint16_t *mask,
+                            int16_t *spd_l, int16_t *spd_r,
+                            uint8_t *corner)
+{
+    if (lost_evt == 0U)
+        return 0U;
+
+    lost_evt = 0U;
+
+    *err10  = lost_evt_err10;
+    *mask   = lost_evt_mask;
+    *spd_l  = lost_evt_sl;
+    *spd_r  = lost_evt_sr;
+    *corner = lost_evt_corner;
+    return 1U;
+}
+
+/* [LOSS-FEAT 2026-11-22] 丢线沿的窗口特征（只观察）。
+   err10 = 最后一条有效线 error×10；slope = 窗口斜率（centi-lane/拍）；
+   sign = 误差变化同号比例 0..100；edge = |err|>3 的拍数；center = |err|<2 的拍数；
+   side = 一侧最大连续亮路数；full = 1 表示出现过一侧 6 路全亮。 */
+uint8_t Control_PopLossFeat(int16_t *err10, int16_t *slope, uint8_t *sign,
+                            uint8_t *edge, uint8_t *center,
+                            uint8_t *side, uint8_t *full)
+{
+    if (lf_evt == 0U)
+        return 0U;
+
+    lf_evt = 0U;
+
+    *err10  = lf_err0_10;
+    *slope  = lf_slope;
+    *sign   = lf_sign;
+    *edge   = lf_edge;
+    *center = lf_center;
+    *side   = lf_side;
+    *full   = lf_full;
+    return 1U;
 }

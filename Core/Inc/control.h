@@ -44,4 +44,18 @@ void Control_GetDebug(ControlDebug *d);
 /* 六边形入口调试快照（转发 special.c 的 Hex_GetDebug）。 */
 void Control_GetHexDebug(HexDebug *d);
 
+/* [LOSTDBG 2026-11-22] 主循环取"刚丢线"快照：err10 / mask 是丢线前一拍
+   （最后一条有效线）的值，spd 是当时左右轮速，corner=1 表示已在过弯状态。
+   用途：手推 45°/60°/断路口，量丢线前 error，定 LOST_BEND_ERR。 */
+uint8_t Control_PopLostLine(int16_t *err10, uint16_t *mask,
+                            int16_t *spd_l, int16_t *spd_r,
+                            uint8_t *corner);
+
+/* [LOSS-FEAT 2026-11-22] 丢线沿的 16 拍窗口特征（只观察，不改控制）。
+   slope 单位 centi-lane/拍；sign 为同号比例 0..100；edge/center 为拍数；
+   side 为一侧最大连续亮路数；full=1 表示出现过一侧 6 路全亮。 */
+uint8_t Control_PopLossFeat(int16_t *err10, int16_t *slope, uint8_t *sign,
+                            uint8_t *edge, uint8_t *center,
+                            uint8_t *side, uint8_t *full);
+
 #endif /* CONTROL_H */
