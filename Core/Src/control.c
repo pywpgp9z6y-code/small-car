@@ -48,6 +48,11 @@ static float   rec2_yaw;           /* [RECOVER2] 丢线后累计转角（HOLD �
 static float   rec2_dir;           /* [RECOVER2] 补转方向：由丢线前一拍的 error 符号定 */
 static uint8_t rec2_armed;         /* [RECOVER2] 1 = 丢线前 |error| 够大，允许补转 */
 static uint8_t rec2_pivot;         /* [RECOVER2] 1 = 本拍正在原地补转（速度环前馈按 pivot 给） */
+static uint8_t rec30_active;       /* [FULLDIST-REC] 1 = 本拍正在向线消失侧 50° 找线 */
+static uint8_t rec30_done;         /* [FULLDIST-REC] 1 = 本次丢线已找过 50°，不重复启动 */
+static uint16_t rec30_ticks;       /* [FULLDIST-REC30] 找线计时 */
+static float   rec30_yaw;          /* [FULLDIST-REC30] 找线累计转角，° */
+static float   rec30_dir;          /* [FULLDIST-REC30] +1 左 / -1 右，由丢线前 error 定 */
 static uint8_t hold_armed;         /* [HEXHOLD 2026-11-22] 大误差丢线，允许 HOLD（六边形区间也生效） */
 static uint8_t hex_boost_ticks;    /* [HEXBOOST] 允许内轮反转的剩余拍数 */
 static uint8_t hex_boost_gap;      /* [HEXBOOST] 窗口结束后的冷却拍数 */
@@ -60,6 +65,8 @@ static uint32_t blind_dist;        /* 已走过的 counts */
 static uint8_t  blind_seen;        /* 连续看到线的拍数（退出用迟滞） */
 static uint16_t blind_tick;        /* 本阶段计时（超时兜底） */
 static float    blind_speed;       /* [BLIND 2026-11-22] 直行段当前速度（爬坡用） */
+static uint8_t  hex_zone_prev;     /* [BLIND-HEX-COOLDOWN] 上一拍六边形区间状态 */
+static uint16_t blind_lockout_ticks; /* [BLIND-HEX-COOLDOWN] 六边形出栈后的盲线冷却 */
 
 /* ---- 编码器 ---- */
 static int16_t last_L = 0, last_R = 0;
@@ -136,9 +143,16 @@ static void Car_Stop(void)
     rec2_yaw        = 0.0f;
     rec2_armed      = 0U;
     rec2_pivot      = 0U;
+    rec30_active    = 0U;  /* [FULLDIST-REC30] */
+    rec30_done      = 0U;
+    rec30_ticks     = 0U;
+    rec30_yaw       = 0.0f;
+    rec30_dir       = 0.0f;
     blind_phase = 0U;      /* [BLIND 2026-11-18] */
     blind_yaw   = 0.0f;
     blind_dist  = 0U;
+    blind_lockout_ticks = 0U;   /* [BLIND-HEX-COOLDOWN] */
+    hex_zone_prev       = 0U;
 
     car.spin.mode = 0U;
     car.spin.yaw = 0.0f;
@@ -149,15 +163,21 @@ static void Car_Stop(void)
     car.straight.speed = 0.0f;
     car.straight.dist = 0U;
     car.straight.ticks = 0U;
+
+    Flow_Reset();          /* [FLOW] 停车/重新发车时清观察窗口 */
 }
 
 void Control_Start(void)
 {
+    /* [PUSH-DEBUG] 推车观察可能留下了 Corner/Hex/盲线状态，发车前统一清干净。 */
+    Car_Stop();
+
     pid_L.integral = 0.0f;
     pid_R.integral = 0.0f;
     dir_pid.integral = 0.0f;
     car.speed_cmd = BASE_SPEED;
     Launch_Reset();
+    Flow_Reset();          /* [FLOW] 新一次发车，从干净窗口开始观察 */
     car.run_flag = 1U;
 }
 
@@ -334,6 +354,17 @@ static uint8_t MaskRun(uint16_t m, uint8_t start)
     return best;
 }
 
+/* [FULLDIST-REC30 2026-11-24] FULLDIST 两段硬编码失败区。
+   只覆盖两段，中间保持 HOLD；现场有 5 个弯必须靠 HOLD。 */
+static uint8_t FullDistInBlock(uint32_t fd)
+{
+    if ((fd >= FULLDIST_BLOCK1_MIN) && (fd <= FULLDIST_BLOCK1_MAX))
+        return 1U;
+    if ((fd >= FULLDIST_BLOCK2_MIN) && (fd <= FULLDIST_BLOCK2_MAX))
+        return 1U;
+    return 0U;
+}
+
 static uint8_t Control_Direction(void)
 {
     LineSample line;
@@ -343,6 +374,10 @@ static uint8_t Control_Direction(void)
     float      turn;
     uint8_t    have_control;
     uint8_t    corner_was_active;
+    uint8_t    flow_fire = 0U;      /* [FLOW-OR] 本拍是否有新策略触发请求 */
+    float      flow_dir  = 0.0f;
+    uint8_t    full_in_range = 0U;  /* [FULLDIST-REC30] 1 = FULLDIST 在硬编码区间 */
+    uint32_t   full_dist = 0U;
 
     /* 特殊动作只更新目标，其余巡线逻辑全部跳过 */
     if (car.spin.mode)
@@ -358,6 +393,64 @@ static uint8_t Control_Direction(void)
 
     /* 1) 12 路 -> 偏差 */
     Sensor_Scan(&line);
+
+    /* [FLOW 2026-11-23] 流动直角弯观察：只维护窗口和事件队列，不参与控制。
+       用过滤后的 line.mask（单路坏点已经在 Sensor_Scan 里变成 0）。
+       未发车时不喂，避免上电/推车阶段污染 1.28 s 窗口。 */
+    if (car.run_flag != 0U)
+    {
+        Flow_Update(line.mask, line.raw_cnt, line.raw_mask);
+
+#if (CORNER_TRIGGER_FLOW == 1)
+        /* [FLOW-OR] 取一次性触发请求，后面交给 Corner_Update 进 ARC。
+           [2026-11-24] FLOW 不参与六边形否决，这里只在 FLOW 接管过弯时取。 */
+        flow_fire = Flow_TakeFire(&flow_dir);
+#endif
+    }
+
+    /* [FULLDIST-REC30 2026-11-24] FULLDIST 硬编码区间：
+       区间内丢线优先级最高：向线消失侧最多 50° 找线，不交给 HOLD/六边形/盲穿。
+       区间外完全不执行，HOLD 保持原功能。
+       注意：起点是本次运行第一个全亮，单调累计，不会中途重置。 */
+    if ((Corner_GetFullDist(&corner, &full_dist) != 0U) &&
+        (FullDistInBlock(full_dist) != 0U))
+    {
+        full_in_range = 1U;
+    }
+
+    if (rec30_active != 0U)
+    {
+        /* 找到线或出了区间：立刻结束；找到线时本拍不覆盖方向环 */
+        if ((line.cnt > 0U) || (full_in_range == 0U))
+        {
+            rec30_active = 0U;
+            rec30_done   = 0U;
+        }
+    }
+    else if (rec30_done != 0U)
+    {
+        /* 本次丢线已经找过 50°，等线回来或出区间才允许下一次 */
+        if ((line.cnt > 0U) || (full_in_range == 0U))
+            rec30_done = 0U;
+    }
+    else if ((line.cnt == 0U) && (full_in_range != 0U) && (car.run_flag != 0U))
+    {
+        rec30_active = 1U;
+        rec30_done   = 0U;
+        rec30_ticks  = 0U;
+        rec30_yaw    = 0.0f;
+        /* 方向 = 丢线前一拍线消失的那一侧：error<0 线在左 -> 左转；
+           error>0 线在右 -> 右转。不能固定右转，镜像失败会越转越远。 */
+        rec30_dir    = (rec2_dir >= 0.0f) ? 1.0f : -1.0f;
+
+        /* 找线优先级最高：先把可能正在跑的盲穿停掉 */
+        blind_phase = 0U;
+        blind_seen  = 0U;
+        blind_tick  = 0U;
+
+        /* 优先级最高：把六边形状态机整体停掉，后面交回方向环 */
+        Hex_Reset(&hex);
+    }
 
     /* [LOSS-FEAT] 更新 16 拍窗口（含当前拍；丢线拍 cnt=0 也会进窗口） */
     {
@@ -583,26 +676,66 @@ static uint8_t Control_Direction(void)
     }
 
     /* 3) 丢线保护：过弯锁存期间/斜穿期间不因线暂时消失而停 */
-    if (line.cnt == 0U && !Corner_IsActive(&corner) && (blind_phase == 0U))//丢线且不处于过弯态
+    if (car.run_flag != 0U)
     {
-        if (++car.lost_cnt >= LOST_STOP_TICKS)
+        if (line.cnt == 0U && !Corner_IsActive(&corner) && (blind_phase == 0U))//丢线且不处于过弯态
         {
-            Car_Stop();
-            return 1U;
+            if (++car.lost_cnt >= LOST_STOP_TICKS)
+            {
+                Car_Stop();
+                return 1U;
+            }
+        }
+        else
+        {
+            car.lost_cnt = 0U;
         }
     }
     else
     {
+        /* [PUSH-DEBUG 2026-11-23] 未发车时只做推车观察：不触发丢线停车，
+           否则推车过六边形时 line.cnt=0 超过 1.2 s 会 Car_Stop 把 Hex 状态清掉，
+           就看不到入栈后的累计角/净角了。 */
         car.lost_cnt = 0U;
     }
 
     /* 4) 六边形检测先跑，会取消通用过弯锁存 */
     /* [HEX4 2026-11-21] 换成"两次 V"状态机：多传当前误差和方向环舵量
        （误差用来判"大误差方向"，舵量用来做第一次 V 之后的回正）。 */
-    hex_out = Hex_Update4(&hex, &corner,
-                          line.center, line.right, line.left, line.mask,
-                          Gyro_IsOk(), Gyro_GetZ(),
-                          line.error, pid_turn);
+    if (rec30_active != 0U)
+    {
+        /* [FULLDIST-REC30] 区间内找线优先级最高：本拍不让六边形抢控制，
+           也不让它重新武装；Hex_Reset 已经把 hex_zone 清 0。 */
+        hex_out.turn         = 0.0f;
+        hex_out.speed_cmd    = 0.0f;
+        hex_out.have_control = 0U;
+    }
+    else
+    {
+        hex_out = Hex_Update4(&hex, &corner,
+                              line.center, line.right, line.left, line.mask,
+                              Gyro_IsOk(), Gyro_GetZ(),
+                              line.error, flow_fire, flow_dir, pid_turn);
+    }
+
+    /* [BLIND-HEX-COOLDOWN 2026-11-23] 六边形刚出栈：清掉可能遗留的盲线状态，
+       并锁 20 拍，让方向环先尝试抓线；这 20 拍内不启动新的盲穿。 */
+    {
+        uint8_t hz_now = Hex_ZoneActive();
+
+        if ((hex_zone_prev != 0U) && (hz_now == 0U))
+        {
+            blind_phase = 0U;
+            blind_seen  = 0U;
+            blind_tick  = 0U;
+            blind_dist  = 0U;
+            blind_lockout_ticks = BLIND_HEX_EXIT_LOCKOUT_TICKS;
+        }
+
+        hex_zone_prev = hz_now;
+        if (blind_lockout_ticks > 0U)
+            --blind_lockout_ticks;
+    }
 
     /* [原地转] 六边形入口在做原地转时，前馈必须按 pivot 给（FF_PIVOT），
        否则 FF_DRIVE×45 只有 144，连死区都越不过去。
@@ -623,6 +756,7 @@ static uint8_t Control_Direction(void)
                              line.mask,                          /* [CW 2026-11-15] 直角弯检测用 */
                              Gyro_IsOk(), Gyro_GetZ(),
                              (sp_l + sp_r) * 0.5f,               /* 幅值平均：pivot 时 ≈ 45，真堵转时 ≈ 0 */
+                             flow_fire, flow_dir,                /* [FLOW-OR] 新策略触发请求 */
                              &speed_local);
     }
     have_control = (line.cnt > 0U || corner_was_active ||
@@ -663,8 +797,11 @@ static uint8_t Control_Direction(void)
                ② 大误差（>=LOST_BEND_ERR）-> HOLD + 90° 同向补转；
                ③ 小误差 -> 盲穿，直接启动，不等 HOLD。
                下面只启动③；①② 在后面的 HOLD 块里。 */
-            if ((line.cnt == 0U) && (car.lost_cnt >= BLIND_START_TICKS) &&
+            if ((line.cnt == 0U) && (line.raw_cnt == 0U) &&
+                (car.lost_cnt >= BLIND_START_TICKS) &&
+                (blind_lockout_ticks == 0U) &&
                 (rec2_armed == 0U) &&
+                (rec30_done == 0U) &&
                 (Corner_IsPending() == 0U) &&
                 (Corner_GaveUpNoLine() == 0U))
             {
@@ -689,21 +826,23 @@ static uint8_t Control_Direction(void)
             /* [FIX 2026-11-18] 退出要连续 BLIND_SEEN_TICKS 拍看到线。
                原来 1 拍就退出，断线区边缘闪一下 -> 整个状态重置 -> 角度归零
                -> 再启动再归零，永远转不到目标角。 */
+            /* [BLIND-STOP 2026-11-23] 盲线状态一旦激活，不代表可以无视线：
+               只要这一拍看到有效线，就立刻停止盲线打舵，先把控制权交回方向环；
+               连续 BLIND_SEEN_TICKS 拍看到线才真正退出盲线状态。
+               这样不会出现“车已经在线上，盲线还按固定右转继续把车带出去”。 */
             if (line.cnt > 0U)
             {
                 if (blind_seen < 250U) ++blind_seen;
+                if (blind_seen >= BLIND_SEEN_TICKS)
+                    blind_phase = 0U;
+                /* 本拍不输出盲线 turn/speed，保留方向环的 turn */
             }
             else
             {
-                blind_seen = 0U;
-            }
+                float ya;
 
-            if (blind_seen >= BLIND_SEEN_TICKS)
-            {
-                blind_phase = 0U;                               /* 真的找到线了，交回 */
-            }
-            else
-            {
+                blind_seen = 0U;
+
                 if (Gyro_IsOk())
                     blind_yaw += Gyro_GetZ() * 0.01f;
 
@@ -774,12 +913,13 @@ static uint8_t Control_Direction(void)
         rec2_ticks      = 0U;
         rec2_yaw        = 0.0f;
 
-        /* [RECOVER2] 方向 = 线消失的那一侧：error>0（线在右）-> turn<0（右转）。
-           资格 = 丢线前一拍 |error| 够大（是弯，不是断线缺口）+ 陀螺可用
-                + 不在六边形区间 + 不在过弯状态机里。 */
         rec2_dir   = (line.error > 0.0f) ? -1.0f : 1.0f;
         /* [LOST3 2026-11-22] 大/小分界改用 LOST_BEND_ERR(2.0)：
            手推实测断路 0.5 路，45°/60° 3.5~5.5 路。 */
+
+        /* [RECOVER2] 方向 = 线消失的那一侧：error>0（线在右）-> turn<0（右转）。
+           资格 = 丢线前一拍 |error| 够大（是弯，不是断线缺口）+ 陀螺可用
+                + 不在六边形区间 + 不在过弯状态机里。 */
         rec2_armed = ((ae >= LOST_BEND_ERR) &&
                       (Gyro_IsOk() != 0U) &&
                       (Hex_ZoneActive() == 0U) &&
@@ -790,10 +930,25 @@ static uint8_t Control_Direction(void)
 
         /* [HEXHOLD 2026-11-22] 六边形区间里丢线也要 HOLD：
            大误差 -> 保持最后一拍舵并继续加舵 16 拍；但不做 90° 补转
-           （rec2_armed 仍排除 hex，避免在六边形里原地转 90°）。 */
-        hold_armed = ((ae >= LOST_BEND_ERR) &&
-                      (Gyro_IsOk() != 0U) &&
-                      (Corner_IsActive(&corner) == 0U)) ? 1U : 0U;
+           （rec2_armed 仍排除 hex，避免在六边形里原地转 90°）。
+           [2026-11-24] FULLDIST 硬编码：850000~865000 这段禁止 HOLD。
+           这一段是 TURN_IN 丢线后才启动的，所以不能加 Hex_ZoneActive()==0，
+           否则 state2/3 内的 HOLD 会绕过。 */
+        {
+            uint32_t full_dist;
+            uint8_t  full_hold_block = 0U;
+
+            if ((Corner_GetFullDist(&corner, &full_dist) != 0U) &&
+                (FullDistInBlock(full_dist) != 0U))
+            {
+                full_hold_block = 1U;
+            }
+
+            hold_armed = ((ae >= LOST_BEND_ERR) &&
+                          (Gyro_IsOk() != 0U) &&
+                          (Corner_IsActive(&corner) == 0U) &&
+                          (full_hold_block == 0U)) ? 1U : 0U;
+        }
     }
     else if ((Corner_IsActive(&corner) == 0U) && (blind_phase == 0U) &&
              (Corner_GaveUpNoLine() == 0U) && (hex_pivot_active == 0U))
@@ -859,6 +1014,34 @@ static uint8_t Control_Direction(void)
                 have_control  = 1U;
             }
         }
+        }
+    }
+
+    /* [FULLDIST-REC30 2026-11-24] 区间内丢线找线，优先级最高：
+       覆盖六边形/过弯/HOLD/盲穿的任何输出，向线消失侧原地转，最多 50°。
+       找到线时上面已经清 rec30_active，本段不执行，交回方向环；
+       50° 还没线则置 done=1，本次丢线不再重复转。 */
+    if (rec30_active != 0U)
+    {
+        float a;
+
+        if (Gyro_IsOk() != 0U)
+            rec30_yaw += Gyro_GetZ() * 0.01f;
+
+        ++rec30_ticks;
+
+        turn          = rec30_dir * FULLDIST_REC30_TURN;   /* 向线消失侧原地转 */
+        car.speed_cmd = 0.0f;                   /* 原地 */
+        have_control  = 1U;
+        rec2_pivot    = 1U;                     /* 速度环按 pivot 给前馈，护栏放行 */
+        hex_pivot_active = 0U;
+
+        a = (rec30_yaw >= 0.0f) ? rec30_yaw : -rec30_yaw;
+
+        if ((a >= FULLDIST_REC30_DEG) || (rec30_ticks >= FULLDIST_REC30_TICKS))
+        {
+            rec30_active = 0U;
+            rec30_done   = 1U;
         }
     }
 
@@ -970,6 +1153,59 @@ static float FF_Apply(float target, float slope)
     if (target < -MOTOR_MIN_TARGET) ff -= FF_DRIVE_OFFSET;
 
     return ff;
+}
+
+/* [ARC-BRAKE 2026-11-23] 里程内环刹车：
+   只覆盖内轮 CCR，外轮完全不动。
+   ccr_mag = BASE + KP × (目标里程 - 已走里程)，到目标/超时后交回速度环。 */
+static void ArcBrake_End(void)
+{
+    corner.arc_brake_active = 0U;
+    corner.arc_brake_ticks  = 0U;
+
+    /* 刹车期间内轮速度环仍在积分，退出时清掉，避免交回瞬间冲一下 */
+    if (corner.dir > 0.0f)
+    {
+        pid_L.integral  = 0.0f;
+        pid_L.pre_error = 0.0f;
+    }
+    else
+    {
+        pid_R.integral  = 0.0f;
+        pid_R.pre_error = 0.0f;
+    }
+}
+
+static void ArcBrake_Apply(float *out_l, float *out_r)
+{
+    float   err;
+    float   mag;
+
+    if ((corner.state != CORNER_ST_ARC) || (corner.arc_brake_active == 0U))
+        return;
+
+    if (++corner.arc_brake_ticks > ARC_BRAKE_PID_MAX_TICKS)
+    {
+        ArcBrake_End();
+        return;
+    }
+
+    err = (float)ARC_BRAKE_DIST_COUNTS - (float)corner.dist;
+    if (err <= 0.0f)
+    {
+        ArcBrake_End();
+        return;
+    }
+
+    mag = ARC_BRAKE_BASE_CCR + ARC_BRAKE_KP * err;
+    if (mag < 0.0f) mag = 0.0f;
+    if (mag > ARC_BRAKE_CCR_MAX) mag = ARC_BRAKE_CCR_MAX;
+
+    /* dir=+1 左转，左轮是内轮；dir=-1 右转，右轮是内轮 */
+    if (corner.dir > 0.0f)
+        *out_l = -mag;
+    else
+        *out_r = -mag;
 }
 
 /* 返回 1 = 连续卡死已停车，Control_Update 必须立刻退出（等价于原来的 return）。 */
@@ -1107,6 +1343,7 @@ static uint8_t Control_Speed(void)
             {
                 float ff_l = FF_Apply(pid_L.target, FF_L(pid_L.target));
                 float ff_r = FF_Apply(pid_R.target, FF_R(pid_R.target));
+                float out_l, out_r;
 
                 /* [GND 2026-11-14] 差速前馈：速度前馈降低后，单靠 FF×turn 不足以
                    压过左右电机的效率差，方向环的小修正会被死区吞掉。
@@ -1125,8 +1362,13 @@ static uint8_t Control_Speed(void)
                     ff_r += dff;
                 }
 
-                Motor_Output(ff_l + PID_Calc(&pid_L, speed_L),
-                             ff_r + PID_Calc(&pid_R, speed_R));
+                out_l = ff_l + PID_Calc(&pid_L, speed_L);
+                out_r = ff_r + PID_Calc(&pid_R, speed_R);
+
+                /* [ARC-BRAKE] 入口阶段用里程环覆盖内轮 CCR */
+                ArcBrake_Apply(&out_l, &out_r);
+
+                Motor_Output(out_l, out_r);
             }
         }
     }
@@ -1200,6 +1442,12 @@ void Control_GetDebug(ControlDebug *d)
 void Control_GetHexDebug(HexDebug *d)
 {
     Hex_GetDebug(&hex, d);
+}
+
+/* [FULLDIST 2026-11-24] 转发 special.c 的“第一个全亮到当前”距离。 */
+uint8_t Control_GetFullDist(uint32_t *dist)
+{
+    return Corner_GetFullDist(&corner, dist);
 }
 
 /* [LOSTDBG 2026-11-22] 主循环取"刚丢线"的一次性快照。

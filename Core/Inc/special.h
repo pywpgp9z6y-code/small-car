@@ -2,6 +2,7 @@
 #define SPECIAL_H
 
 #include <stdint.h>
+#include "car_config.h"
 
 /* 过弯四段状态（[APPROACH 2026-11-14]） */
 typedef enum {
@@ -60,8 +61,13 @@ typedef struct {
     uint16_t settle_ticks;   /* [SETTLE 2026-11-15] 收尾段计时 */
     float    recover_dir;    /* [RECOVER 2026-11-16] 找线方向（= -dir） */
     uint16_t recover_ticks;  /* [RECOVER 2026-11-16] 找线计时 */
+    float    arc_recover_dir;/* [ARC-RECOVER 2026-11-24] 段8补转方向：
+                                由最后有效线 bias 定：线左 -> +1，线右 -> -1 */
+    uint16_t last_valid_mask;/* [ARC-RECOVER 2026-11-24] 最后一条有效线的 mask */
     uint16_t arc_ticks;      /* [ARC 2026-11-18] 弧线过弯计时 */
     uint8_t  arc_line_ticks; /* [ARC 2026-11-18] 出弯后连续看到线的拍数 */
+    uint8_t  arc_brake_active; /* [ARC-BRAKE 2026-11-23] 1 = 里程内环刹车中 */
+    uint16_t arc_brake_ticks;  /* [ARC-BRAKE] 刹车已执行拍数 */
 } CornerState;
 
 /* [CWDBG 2026-11-22] 直角弯判据的一次性事件快照（中断入队，主循环打印） */
@@ -126,6 +132,7 @@ typedef struct {
     uint16_t off_l;
     uint32_t dist;
     uint16_t arm;
+    int16_t  net10;      /* [HEX4-NET] 有向净角 ×10 */
 } HexDebug;
 
 void Corner_Reset(CornerState *c);
@@ -138,6 +145,9 @@ uint8_t Corner_IsPending(void);
 /* [LOST3 2026-11-22] 直角弯补转 20° 后仍无线：control 看到就直接走 LOST_STOP，
    不再落到 45/60 的 HOLD / 90° 补转。 */
 uint8_t Corner_GaveUpNoLine(void);
+/* [FULLDIST 2026-11-24] 本次运行第一个“全亮”（>=10 路亮）到当前的距离（counts）。
+   第一个全亮之后起点固定，不会再因后续全亮而重置。 */
+uint8_t Corner_GetFullDist(const CornerState *c, uint32_t *dist);
 void Corner_AddDistance(CornerState *c, uint32_t counts);   /* [APPROACH 2026-11-14] */
 
 /* [CW2 2026-11-21] 直角弯判据的逐拍记录（串口 'c' 打印）：
@@ -166,6 +176,8 @@ float Corner_Update(CornerState *c,
                     uint8_t gyro_ok,
                     float gyro_z,
                     float speed_meas,
+                    uint8_t flow_fire,  /* [FLOW-OR] 1 = FLOW 请求触发 ARC */
+                    float flow_dir,     /* [FLOW-OR] +1 左 / -1 右 */
                     float *speed_cmd);
 
 void Hex_Reset(HexState *h);
@@ -195,6 +207,8 @@ HexOutput Hex_Update4(HexState *h,
                       uint8_t gyro_ok,
                       float gyro_z,
                       float error,
+                      uint8_t flow_fire,   /* [HEX4-FLOW-VETO] FLOW 本拍触发请求 */
+                      float flow_dir,      /* +1 左 / -1 右 */
                       float pid_turn);
 
 void Hex4_Reset(void);     /* 发车/停车时清状态，Hex_Reset 里会调用 */
@@ -207,5 +221,61 @@ uint8_t Hex_PopEvent(uint8_t *code, uint32_t *dist, uint16_t *mask,
 uint8_t HexLog_Count(void);
 void    HexLog_GetAt(uint8_t i, int16_t *cnt, uint16_t *mask, int16_t *err, uint8_t *flag);
 void    HexLog_Clear(void);
+
+/* ================= [FLOW 2026-11-23] 流动直角弯检测 =================
+   第一阶段只并行观察，不接管电机。100 Hz 调用
+   Flow_Update(line.mask, line.raw_cnt, line.raw_mask)，主循环用 Flow_PopEvent() 取事件打印 FLOW 行。
+   方向约定：+1 = 左转，-1 = 右转，0 = 十字/发车线。 */
+typedef enum {
+    FLOW_EVT_NONE  = 0U,
+    FLOW_EVT_LEFT  = 1U,
+    FLOW_EVT_RIGHT = 2U,
+    FLOW_EVT_CROSS = 3U
+} FlowEventType;
+
+typedef struct {
+    uint8_t  type;        /* FlowEventType */
+    int8_t   dir;         /* +1 左 / -1 右 / 0 十字 */
+    uint16_t new_mask;    /* 刚加的通道（bit i = ch i） */
+    uint16_t run_mask;    /* 当前主连续段 */
+    uint8_t  run_l;       /* 当前主段左端 */
+    uint8_t  run_r;       /* 当前主段右端 */
+    uint8_t  prev_l;      /* 上一拍主段左端 */
+    uint8_t  prev_r;      /* 上一拍主段右端 */
+    int8_t   width_jump;  /* 当前主段宽度 - 上一拍主段宽度 */
+    uint8_t  new_l_cnt;   /* 新通道里落在左半边的数量 */
+    uint8_t  new_r_cnt;   /* 新通道里落在右半边的数量 */
+} FlowEvent;
+
+/* [FLOW-SNAP] 检测到左/右直角弯后，自动保存 1.28 s 窗口。
+   中断里只拷贝 mask，不 printf；主循环 Flow_PopSnapshot() 取出来后打印。 */
+typedef struct {
+    FlowEvent event;
+    uint8_t   num;                    /* 有效拍数，最多 FLOW_WIN_TICKS */
+    uint16_t  mask[FLOW_WIN_TICKS];   /* 按时间顺序：mask[0] 最旧 */
+} FlowSnapshot;
+
+typedef struct {
+    uint8_t  reason;      /* 0=真丢线 1=单路被过滤 2=主段换段 */
+    uint8_t  raw_cnt;     /* 过滤前亮灯路数 */
+    uint16_t raw_mask;    /* 过滤前 mask */
+    uint16_t prev_mask;   /* Flow 上一拍的主段 */
+    uint16_t cur_mask;    /* 当前主段；0 表示本拍没有主段 */
+    uint8_t  prev_l;
+    uint8_t  prev_r;
+} FlowDiag;
+
+void    Flow_Reset(void);
+void    Flow_Update(uint16_t mask, uint8_t raw_cnt, uint16_t raw_mask);
+uint8_t Flow_PopEvent(FlowEvent *e);
+uint8_t Flow_PopSnapshot(FlowSnapshot *s);
+uint8_t Flow_PopDiag(FlowDiag *d);
+uint8_t Flow_TakeFire(float *dir);   /* [FLOW-OR] 取一次性 ARC 触发请求 */
+
+/* 1.28 s 窗口转储（串口 'f'） */
+uint8_t Flow_LogCount(void);
+void    Flow_GetAt(uint8_t i, uint16_t *mask, uint8_t *l, uint8_t *r, uint8_t *width);
+void    Flow_ClearLog(void);
+void    Flow_LogPause(uint8_t en);   /* 主循环转储时暂停写入 */
 
 #endif /* SPECIAL_H */

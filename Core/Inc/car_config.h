@@ -154,6 +154,21 @@
                                             现在只保留"修左右轮差异"的作用。 */
 #define ARC_MAX_TICKS           100U     /* 1 s 兜底 */
 
+/* ---- [ARC-BRAKE 2026-11-23] ARC 入口的里程内环刹车 ----
+   现有 -70 + 速度环，日志里内轮从 +40~+280 回到 0 大约 50~100 ms；
+   0.69 m/s 下约 3.5~6.9 cm。先取 4 cm 作为刹车距离目标，
+   后面按实测再调 ARC_BRAKE_DIST_CM。
+
+   控制方式：只覆盖内轮的 CCR，不改外轮。
+   ccr_mag = BASE + KP * (目标里程 - 已走里程)，限制在 [0, MAX]。
+   到目标里程 / 超时后交回原速度环。 */
+#define ARC_BRAKE_DIST_CM       4.0f
+#define ARC_BRAKE_DIST_COUNTS   ((uint32_t)(ARC_BRAKE_DIST_CM * COUNTS_PER_CM))
+#define ARC_BRAKE_KP            0.7f     /* CCR / count：4 cm 误差约 1220 CCR */
+#define ARC_BRAKE_BASE_CCR      300.0f   /* 到目标时保留的基础反接量，接近原 -70 前馈 */
+#define ARC_BRAKE_CCR_MAX       1500.0f  /* 里程环最大反接 CCR，不直接打满 PWM */
+#define ARC_BRAKE_PID_MAX_TICKS 20U      /* 200 ms 兜底，避免一直卡在刹车态 */
+
 /* ---- 断线区斜穿（[BLIND 2026-11-18]） ----
    不是直角弯/六边形的场合丢线时，按固定角度斜穿过去找线：
    tan = 15/65 -> 13.0°，路程 = √(15²+65²) = 66.7 cm。 */
@@ -184,11 +199,14 @@
                                             线只露 1~2 拍就会冲过去。 */
 #define BLIND_TURN_MAX_TICKS    60U      /* 转向阶段超时（0.6 s），兜底强制进直行 */
 #define BLIND_RUN_MAX_TICKS     600U     /* 直行阶段超时（6 s），兜底放弃 */
+#define BLIND_HEX_EXIT_LOCKOUT_TICKS 20U /* [BLIND-HEX-COOLDOWN 2026-11-23]
+                                            六边形出栈后 20 拍（200 ms）内不启动盲线，
+                                            先把控制权交回方向环，避免出栈后立刻盲穿。 */
 #define ARC_BRAKE_TICKS         5U       /* [BRAKE 2026-11-18] 旧固定窗口（ARC2 下不再使用） */
 #define ARC_BRAKE_MAX_TICKS     20U      /* [ARC2 2026-11-21] 刹车窗口上限 20 拍（200 ms）。
                                             实际会提前结束：内轮实测降到 ARC_BRAKE_SPEED_MIN
                                             以下就不再反接。这样不依赖电池电压/入弯速度。 */
-#define ARC_BRAKE_TARGET        -40.0f   /* 反脉冲的目标速度（只越过反向死区，不是全速反接） */
+#define ARC_BRAKE_TARGET        -50.0f   /* 反脉冲的目标速度（只越过反向死区，不是全速反接） */
 #define ARC_BRAKE_SPEED_MIN     40.0f    /* 实测速度高于此值才反接（低速反接没意义还伤电机） */
 #define ARC_TRIG_ERR            3.5f     /* [ARC 2026-11-18] 圆弧触发还要求误差已接近极限。
                                             只靠"宽线"会把缓弯、十字路口全当成直角弯
@@ -259,6 +277,13 @@
                                             5 会让 45° 也被判成直角弯。
                                             退回 6：45° 安全；刁钻路口不触发，靠 HOLD/盲穿兜底。
                                             要救那个路口，得找"路数之外"的第二个判据。 */
+
+/* [2026-11-24] 全亮否决开关：
+   1 = 看到 >=10 路亮（十字/地面标记）就清掉 CW4 已挂起的候选；
+   0 = 不因全亮取消候选，让一侧 6 路全亮 + 后接丢线仍然可以判直角弯。
+   现场问题：六边形出口 / 45° 接直角的位置，线会短时全亮，
+   原来的 1 会把候选清掉，出口后的直角弯就不转了。 */
+#define CORNER_FULLBRIGHT_VETO  1
 #define CORNER_FULL_HOLD_TICKS  25U      /* [CW2 2026-11-21] 手推实测定的，不是猜的：
                                             直角弯"最后一拍全亮" -> "丢线第一拍"实测 18 拍
                                             （mask 127 持续 16 拍 -> 124 -> 60 -> 48 -> 32 -> 0）。
@@ -305,7 +330,7 @@
 #define CORNER_SETTLE_TOL       1.5f     /* 到位容差，° */
 #define CORNER_SETTLE_RATE      20.0f    /* |角速度| 低于此值算“已停住”，°/s */
 #define CORNER_SETTLE_MAX_TICKS 30U      /* 收尾最多 300 ms，超时放弃 */
-#define CORNER_RECOVER_DEG      20.0f    /* [LOST3 2026-11-22] 90 -> 20：按用户逻辑，
+#define CORNER_RECOVER_DEG      40.0f    /* [LOST3 2026-11-22] 90 -> 20：按用户逻辑，
                                             直角弯转完还丢线只补 20°（同向补转 + 反向找线
                                             共用这个上限）；补满 20° 还没线就 LOST_STOP 停车，
                                             不再落到 45/60 的 90° 补转。 */
@@ -337,7 +362,7 @@
 /* ---- 六边形入口：V 型判据（[HEX-V 2026-11-15]） ----
    通道分组：a = ch0,1 / ch10,11（两端）
              b = ch2,3,4 / ch7,8,9（两中段，**三路全亮才算 b 存在**；任意一路暗即 !b）
-             c = ch5 & ch6（正中）
+             c = ch5 || ch6（正中；[V-ONE] 两路似乎严苛，尝试只看一路）
    一次 V = 某侧 a 亮 && c 亮 && 同侧 b 不完整（中间有缺口）。
    [实测 2026-11-15 手推] 六边形**每个顶点只产生一次 V**，相邻顶点 10~16 cm，
    不存在"两次 V 相隔 2 cm"——所以按单次 V 直接触发。
@@ -374,7 +399,7 @@
    入口：第一次 V 武装（记录大误差方向 + 把方向环打偏的那部分回正），
          10~20 cm 内出现**同侧**第二次 V 且大误差方向一致 -> 进入，向记录方向打 30°；
    途中：交回方向环走六边形，陀螺累计转角；
-   出口：累计 350~370° 且遇到下一个 V -> 记为出口，向该 V 误差方向的**反方向**打 30°，
+   出口：有向净角累计 320~340° 后强制出栈，向反方向打 30°，
          然后交回方向环找线。 */
 #define HEX4_V2_MIN_CM          6.0f     /* [HEX4 2026-11-21] 10 -> 6：实测入口两次 V 相距 8.5 cm
                                             （第一次跑被 10 cm 下限挡掉，只打出 HEX,4 就解除了）。
@@ -389,6 +414,25 @@
 #define HEX4_ARM_DIST_CM        9.0f     /* [HEX4] NEED_V2=0 时，武装后走这么远就进 */
 #define HEX4_ARM_DIST_COUNTS    ((uint32_t)(HEX4_ARM_DIST_CM * COUNTS_PER_CM))
 
+/* [HEX4-ENTRYONLY 2026-11-23] 六边形逻辑只保留入口 30° 打舵：
+   入口 V1 -> 9 cm -> TURN_IN 30° -> 交回方向环，不再跑 DRIVING/出口 V/TURN_OUT。
+   之后靠方向环和直角弯检测走完六边形；用 lockout 防止刚打完 30° 又被 V 重新入口。
+   回滚：HEX4_ENTRY_ONLY=0。 */
+#define HEX4_ENTRY_ONLY         0
+#define HEX4_ENTRY_ONLY_LOCKOUT_CM 120.0f  /* 入口完成后 120 cm 内不再识别六边形 V */
+#define HEX4_ENTRY_ONLY_LOCKOUT_COUNTS ((uint32_t)(HEX4_ENTRY_ONLY_LOCKOUT_CM * COUNTS_PER_CM))
+
+/* [HEX4-NET 2026-11-23] 有方向的角度积分出口：
+   从入口 30° 打舵开始累计 hx_net = ∫ hx_dir·gyro_z dt。
+   - 正常六边形：hx_net 连续涨到 320~340° 左右 -> 强制出栈打舵；
+   - 双六边形：先涨后反向回落；峰值 - 当前 >120° 且回到 ±20° 左右
+     -> 也强制出栈打舵；
+   - 这两条都不是固定“总转角”，而是看有方向的净进度。 */
+#define HEX4_NET_EXIT_DEG       320.0f   /* 出栈窗口 320~340°；到 320° 就强制，
+                                            避免 10 ms 采样直接跨过 340° 上沿。 */
+#define HEX4_NET_REV_DROP_DEG   120.0f   /* 从峰值反向回落超过这么多 */
+#define HEX4_NET_REV_END_DEG    20.0f    /* 且净角回到这个范围，判双六边形返回 */
+
 /* [V2 2026-11-22] 异侧否决：V1 之后、距离窗口内如果再出现一个**异侧** V，
    就取消这次进入（用于双六边形 / 17 号六边形——那种位置 V1 和 V2 是反的）。
    手推实测：V1 左侧 mask 227，4.6 cm 后出现右侧 V mask 3296（HEX,13,2008）。
@@ -399,6 +443,16 @@
 #define HEX4_OPP_MAX_CM         9.0f
 #define HEX4_OPP_MIN_COUNTS     ((uint32_t)(HEX4_OPP_MIN_CM * COUNTS_PER_CM))
 #define HEX4_OPP_MAX_COUNTS     ((uint32_t)(HEX4_OPP_MAX_CM * COUNTS_PER_CM))
+
+/* [HEX4-FLOW-VETO 2026-11-23 -> 2026-11-24 禁用]
+   原意：武装 V 之后，如果 FLOW 判出与 V1 同侧的直角弯，就取消这次
+   六边形入口（记 HEX,19），用来补 17 号节点出口漏检的 V。
+   现场结论：FLOW 的直角弯和六边形 V 不是同一类几何，用它否决 V1
+   会把正常入口一起挡掉，双六边形/17 号反而更乱 —— 禁用。
+   0 = HEX,19 不再产生，Hex_Update4 也不看 flow_fire。
+   代码保留仅作回滚参考，默认不再启用。 */
+#define HEX4_FLOW_VETO          0
+#define HEX4_FLOW_VETO_LATCH_TICKS 20U  /* 仅 HEX4_FLOW_VETO=1 时有效 */
 
 /* ---- [HOLD 2026-11-21] 丢线后保持转向 ----
    45°/60° 弯的线会在 5~6 拍内滑出阵列；那一拍 have_control 变 0，
@@ -442,25 +496,60 @@
 #define HEX4_TURN_RATE          45.0f    /* 打舵用的差速（原地转） */
 #define HEX4_TURN_MAX_CM        12.0f    /* 打舵兜底：走这么多 cm 没转够就放弃 */
 #define HEX4_TURN_MAX_COUNTS    ((uint32_t)(HEX4_TURN_MAX_CM * COUNTS_PER_CM))
-#define HEX4_EXIT_MIN_DEG       260.0f   /* [FIX 2026-11-22] 320 -> 260：实测日志
-                                            HEX,12,299（DRIVING 累计 299° 就看到出栈 V），
-                                            原来的下限 320 把它整个挡在窗口外 —— V 检到了也不出。
-                                            260 覆盖 200 六边形（~300°）和 30° 六边形（~330°）。 */
-#define HEX4_EXIT_MAX_DEG       370.0f   /* 上限保留 370：360° 六边形也能覆盖。
-                                            注：出口 V 只会在状态 3 里出现，窗口宽一点不会
-                                            误触到入口 V（入口 V 在状态 0/1）。 */
-#define HEX4_EXIT_GIVEUP_DEG    400.0f   /* 超过这么多还没等到 V -> 强制解除 */
-#define HEX4_DRIVE_MAX_CM       150.0f   /* [HEX4 2026-11-21] DRIVING 距离兜底：从入口 pivot 起
-                                            走这么多 cm 还没出栈就强制解除（一圈约 120 cm，
-                                            留 30 cm 余量）。没有这条时，出口 V 没认出来
-                                            （HEX,9 丢失）会让状态 3 永久锁死 —— 出弯后走直道
-                                            转角不再增长，永远到不了 400°，直角弯检测一直被
-                                            hex_zone_flag 屏蔽，直到停车才清。 */
+
+/* [2026-11-24] 出栈打舵开关：
+   1 = 出栈后按 hx_dir 原地打 HEX4_TURN_DEG(30°)，再交回方向环；
+   0 = 不打舵，直接清 hex 状态交回方向环（仍然发 HEX,10 表示出栈完成）。
+   暂时置 0，先看方向环能否自然把车带出出口。 */
+#define HEX4_TURN_OUT_ENABLE    1
+#define HEX4_EXIT_MIN_DEG       260.0f   /* 保留 260° 下限，避免 DRIVING 早期 V 误出口。
+                                            上限和角度强制解除先放开，只靠 300 cm 兜底。 */
+#define HEX4_EXIT_MAX_DEG       10000.0f /* [DEBUG 2026-11-23] 先取消出口角度上限：
+                                            实测出口 V 在 total=384° 被 370° 上限挡住，
+                                            先让 260° 之后任意 V 都能出栈。 */
+#define HEX4_EXIT_GIVEUP_DEG    10000.0f /* [DEBUG] 先取消 400° 角度强制解除；
+                                            只保留 HEX4_DRIVE_MAX_CM=300 cm 的距离兜底。 */
+#define HEX4_DRIVE_MAX_CM       300.0f   /* [HEX4 2026-11-23] DRIVING 距离兜底：150 -> 300 cm。
+                                            双六边形/大六边形一圈可能超过 150 cm，原来的 150 cm
+                                            会在出栈 V 之前强制退出（实测 total=329 就被掐断）。
+                                            300 cm 只作为最后的卡死保护，不再参与正常出栈判断。 */
 #define HEX4_DRIVE_MAX_COUNTS   ((uint32_t)(HEX4_DRIVE_MAX_CM * COUNTS_PER_CM))
-#define HEX_V_STRICT_END        1        /* [HEX4] 1 = 端部要求"两路都亮"（ch0&ch1 / ch10&ch11）。
-                                            原版只要有任意一路就成立，单路假亮（ch10 悬空、
-                                            ch1/ch3 漏读）就能伪造 V —— 这是历史误触发的主因。
-                                            改 0 回到原判据。 */
+
+/* [2026-11-24] 出栈锁：刚出栈（HEX,10 或 DRIVING 的 HEX,8 超时）后
+   20 cm 内不允许再次入栈。只禁止 ARMED->TURN_IN，不禁止武装，
+   这样还能继续检测 V；走过 20 cm 后自动解除。
+   注意：不是“20 cm 内不识别 V”，是“20 cm 内不进去”。 */
+#define HEX4_EXIT_LOCKOUT_CM    20.0f
+#define HEX4_EXIT_LOCKOUT_COUNTS ((uint32_t)(HEX4_EXIT_LOCKOUT_CM * COUNTS_PER_CM))
+
+/* [2026-11-24] FULLDIST 硬编码：拆成两段短的，只覆盖两次实际失败点。
+   早段失败：FULLDIST 813510~819796（LOST 前最后一拍 814975）；
+   晚段失败：FULLDIST 851024~861352（LOST 前最后一拍 855615）。
+   中间没有覆盖到的区间保持 HOLD，不能为了省事连成一整段——
+   现场有 5 个弯必须靠 HOLD 才能过。
+   注意：这两个区间必须对 state2/3 也生效（HOLD 是在 TURN_IN 丢线后
+   才启动的），不能再加 Hex_ZoneActive()==0 的条件。 */
+#define FULLDIST_BLOCK1_MIN 808000U
+#define FULLDIST_BLOCK1_MAX 821000U
+#define FULLDIST_BLOCK2_MIN 849000U
+#define FULLDIST_BLOCK2_MAX 863000U
+
+/* [2026-11-24] FULLDIST 区间内的丢线找线：
+   在这个区间里一旦丢线，优先级最高：向线消失的那一侧原地转找线，最多 50°；
+   看到线立刻交回方向环；50° 还没线就停手（不重启，避免反复转）。
+   方向由丢线前最后一拍的 error 符号决定（error<0 线在左 -> 左转；
+   error>0 线在右 -> 右转），不能固定右转，否则镜像失败会越转越远。
+   区间外完全不执行，HOLD 保持可用。
+   宏名里的 REC30 是历史名字，实际角度已改成 50°。 */
+#define FULLDIST_REC30_TURN     45.0f    /* 原地转向差速 */
+#define FULLDIST_REC30_DEG      50.0f    /* 最大转角（30 -> 50） */
+#define FULLDIST_REC30_TICKS    120U     /* 兜底 1.2 s，给 50° 留够时间 */
+
+#define HEX_V_STRICT_END        0        /* [V-ONE 2026-11-23] 两路似乎严苛，尝试只看一路：
+                                              1 = 端部要求 ch0&ch1 / ch10&ch11 两路都亮；
+                                              0 = 只看 ch0||ch1 / ch10||ch11 任意一路。
+                                              c_s 也同步改成 ch5||ch6（见 sensor.c）。
+                                              回滚：改回 1，并把 sensor.c 的 center 改回 &&。 */
 
 /* ---- 六边形区间（[HEX-ZONE 2026-11-15]） ----
    [实测] 六边形**内部 6 个顶点不产生 V**（60° 折角线是连着的，不出现"端点亮+正中亮+中间缺口"）；
@@ -597,6 +686,36 @@
 /* ---- 低速增益调度 ---- */
 #define KP_LOW_SPEED            10.0f
 #define KP_BOOST                2.5f
+
+/* ---- [FLOW 2026-11-23] 流动直角弯检测（第一阶段只观察，不接管） ----
+   1.28 s @ 100 Hz 的 mask 窗口；取最中间的连续灯段，按“上一拍主段中心”
+   分左右；连续段突然变宽，且新增通道只在某一侧 -> 该侧直角弯。
+   两侧同一拍都新增 -> 十字/发车线。 */
+#define FLOW_WIN_TICKS          128U     /* 100 Hz × 1.28 s */
+/* [FLOW-OR 2026-11-23] 两套直角弯触发源，独立开关：
+   - CW4：老策略，"一侧全亮 2 拍 + 全丢线 2 拍"，兜底；
+   - FLOW：新策略，"主连续段宽度跳变 + 单侧新增通道"，更早。
+   两者是 OR 关系：任意一套先触发就进 ARC。
+   debug 时单独置 0 即可关掉其中一套。
+
+   [2026-11-24] FLOW 只做直角弯观察/触发，**不参与六边形入口否决**。
+   HEX4_FLOW_VETO 已置 0；即使以后重开，也只应在确认 FLOW 与六边形 V
+   几何等价之后再启用。 */
+#define CORNER_TRIGGER_CW4      1
+#define CORNER_TRIGGER_FLOW     0
+
+#define FLOW_MIN_WIDTH_JUMP     3U       /* 主连续段至少突然变宽这么多路 */
+#define FLOW_CROSS_MIN_NEW_CH   2U       /* 十字/发车线：每一侧至少新增这么多路。
+                                            怕误触发就保持 2；想放宽改 1。 */
+#define FLOW_COOLDOWN_TICKS     7U       /* 5 cm @ 0.69 m/s = 72.5 ms ≈ 7 拍（70 ms）。
+                                            7 拍 = 4.83 cm，刚好短于最近 5 cm 的直角弯间距，
+                                            不会把下一个弯挡在冷却里。 */
+
+/* [FLOW-SNAP 2026-11-23] 检测到左/右直角弯后自动抓 1.28 s 窗口：
+   中断里只做 256 字节拷贝，不 printf；主循环再按 FL 行输出。
+   FLOW_AUTO_DUMP=0 可关掉自动抓取，只保留 FLOW 事件行。 */
+#define FLOW_AUTO_DUMP          1
+#define FLOW_SNAP_DELAY_TICKS   10U      /* 事件后再抓 10 拍（100 ms），让窗口包含触发后的状态 */
 
 /* ---- 陀螺 ---- */
 #define GYRO_ALPHA              0.3f

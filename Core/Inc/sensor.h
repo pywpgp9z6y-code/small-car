@@ -14,9 +14,11 @@
  * mask 不是原始多路复用字：bit i 对应通道 i（方便调试打印）。
  * ============================================================ */
 typedef struct {
-    uint16_t mask;      /* bit(i) = 通道 i 压线 */
-    uint8_t  cnt;       /* 压线通道数 */
-    uint8_t  center;    /* ch5 与 ch6 同时压线（六边形入口条件） */
+    uint16_t mask;      /* bit(i) = 通道 i 压线（已过滤） */
+    uint8_t  cnt;       /* 压线通道数；单路亮会被过滤为 0（视为坏点） */
+    uint16_t raw_mask;  /* [FLOW-DIAG] 过滤前的原始 mask */
+    uint8_t  raw_cnt;   /* [FLOW-DIAG] 过滤前的亮灯路数 */
+    uint8_t  center;    /* ch5 或 ch6 压线（[V-ONE] 两路似乎严苛，尝试只看一路） */
     uint8_t  right;     /* ch11 */
     uint8_t  left;      /* ch0 */
     float    bias;      /* 压线通道号平均；无压线为 0 */

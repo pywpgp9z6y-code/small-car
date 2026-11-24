@@ -199,12 +199,15 @@ static uint8_t RUN_Key_Scan(void)
     return (HAL_GPIO_ReadPin(GPIO_RUN_GPIO_Port, GPIO_RUN_Pin) == GPIO_PIN_RESET) ? 1 : 0;
 }
 
-/* ---- 串口单字节命令：'2' 原地转 360°，'3' 脱线直线 1 m ----
+/* ---- 串口单字节命令：'2' 原地转 360°，'3' 脱线直线 1 m，
+       'c' 转储 CW 记录，'h' 转储六边形 V 记录，'f' 转储 FLOW 窗口 ----
    中断里只置请求标志，动作由主循环启动，避免在中断里做状态迁移。 */
 static volatile uint8_t spin_request = 0U;
 static volatile uint8_t straight_request = 0U;
 static volatile uint8_t cw_dump_request = 0U;   /* [CW2] 打印直角弯判据的逐拍记录 */
 static volatile uint8_t hexlog_request = 0U;    /* [HEX4] 打印 V 判据的逐拍记录 */
+static volatile uint8_t flow_dump_request = 0U; /* [FLOW] 打印最近 128 拍 mask 窗口 */
+static FlowSnapshot flow_snap;                  /* [FLOW-SNAP] 自动窗口，放静态区避免占栈 */
 static uint8_t uart_rx_byte = 0U;
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
@@ -219,6 +222,8 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
             cw_dump_request = 1U;     /* [CW2] 打印最近 128 拍的 cnt/mask/err/标志 */
         else if (uart_rx_byte == 'h')
             hexlog_request = 1U;      /* [HEX4] 打印最近 128 拍的 V 判据原始记录 */
+        else if (uart_rx_byte == 'f')
+            flow_dump_request = 1U;   /* [FLOW] 打印最近 128 拍的流动 mask 窗口 */
         else if (uart_rx_byte == '0')
             Gyro_ResetYaw();      /* [YAW 2026-11-15] 航向清零，便于手转标定 */
 
@@ -306,17 +311,19 @@ int main(void)
   {
     printf("CCR1,CCR2,tgtLx10,tgtRx10,dL,dR,speedL,speedR\r\n");
     printf("HEX,event,dist,right,left,center,mask,seq\r\n");
-    printf("HEXSTAT,state,total,vrun,right,left,center,dist,arm,mask\r\n");
+    printf("HEXSTAT,state,total,net,vrun,right,left,center,dist,arm,mask\r\n");
+    /* [FULLDIST 2026-11-24] 本次运行第一个全亮（>=10 路亮）到当前的距离，单位 counts */
+    printf("FULLDIST,counts\r\n");
     /* [CWDBG 2026-11-22] 直角弯判据事件 */
     printf("CWD,code,cnt,mask,cw_mask,low,wide,pend,dark,ticks,armed,cool,hz,state,err10\r\n");
     /* [LOSS-FEAT 2026-11-22] 丢线窗口特征 */
     printf("LF,err10,slope,sign,edge,center,side,full\r\n");
-    /* [HEXCFG 2026-11-22] 上电打印实际编译进去的六边形参数，
-       用来确认烧的是不是新代码（HEX,9 不出时先看这一行）。 */
-    printf("HEXCFG,MIN=%d,MAX=%d,GIVEUP=%d,DRIVE=%d,SPEED=%d\r\n",
-           (int)HEX4_EXIT_MIN_DEG, (int)HEX4_EXIT_MAX_DEG,
-           (int)HEX4_EXIT_GIVEUP_DEG, (int)HEX4_DRIVE_MAX_CM,
-           (int)HEX_ZONE_SPEED_MAX);
+    /* [HEXCFG 2026-11-23] 上电打印实际编译进去的六边形参数。
+       现在出口靠有向净角：NET/DROP/END；DRIVE 仍是最外层距离兜底。 */
+    printf("HEXCFG,NET=%d,DROP=%d,END=%d,DRIVE=%d,ENTRYONLY=%d,SPEED=%d\r\n",
+           (int)HEX4_NET_EXIT_DEG, (int)HEX4_NET_REV_DROP_DEG,
+           (int)HEX4_NET_REV_END_DEG, (int)HEX4_DRIVE_MAX_CM,
+           (int)HEX4_ENTRY_ONLY, (int)HEX_ZONE_SPEED_MAX);
   }
 
   pid_L.target = BASE_SPEED ;          // 脉冲/10ms；必须和方向环用同一个常量
@@ -489,6 +496,76 @@ int main(void)
                (int)fedge, (int)fcenter, (int)fside, (int)ffull);
     }
 
+    /* [FLOW 2026-11-23] 流动直角弯事件：中断里只入队，这里打印。 */
+    {
+      FlowEvent fe;
+
+      while (Flow_PopEvent(&fe))
+        printf("FLOW,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\r\n",
+               (int)fe.type, (int)fe.dir, (int)fe.new_mask, (int)fe.run_mask,
+               (int)fe.run_l, (int)fe.run_r, (int)fe.prev_l, (int)fe.prev_r,
+               (int)fe.width_jump, (int)fe.new_l_cnt, (int)fe.new_r_cnt);
+    }
+
+    /* [FLOW-DIAG] 为什么 Flow 的 prev 被清掉：
+       reason 0=真丢线 1=单路被过滤成 0 2=主段换段。
+       如果漏检弯前面出现 reason=1，就是单路过滤把 FLOW 的连续性打断了。 */
+    {
+      FlowDiag fd;
+
+      while (Flow_PopDiag(&fd))
+        printf("FLOWGAP,%d,%d,%d,%d,%d,%d,%d\r\n",
+               (int)fd.reason, (int)fd.raw_cnt, (int)fd.raw_mask,
+               (int)fd.prev_mask, (int)fd.cur_mask,
+               (int)fd.prev_l, (int)fd.prev_r);
+    }
+
+    /* [FLOW-SNAP 2026-11-23] 检测到左/右直角弯后自动打印 1.28 s 窗口。
+       中断里只做内存拷贝；这里在主循环里 printf，不阻塞控制中断。
+       格式：FLOWSNAP,<num>,<type>,<dir>,<new_mask>,<run_mask>,<run_l>,<run_r>,
+                       <prev_l>,<prev_r>,<width_jump>,<new_l_cnt>,<new_r_cnt>
+             FLW,<i>,<mask> */
+    while (Flow_PopSnapshot(&flow_snap))
+    {
+      uint8_t i;
+
+      printf("FLOWSNAP,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\r\n",
+             (int)flow_snap.num, (int)flow_snap.event.type, (int)flow_snap.event.dir,
+             (int)flow_snap.event.new_mask, (int)flow_snap.event.run_mask,
+             (int)flow_snap.event.run_l, (int)flow_snap.event.run_r,
+             (int)flow_snap.event.prev_l, (int)flow_snap.event.prev_r,
+             (int)flow_snap.event.width_jump,
+             (int)flow_snap.event.new_l_cnt, (int)flow_snap.event.new_r_cnt);
+
+      for (i = 0U; i < flow_snap.num; ++i)
+        printf("FLW,%d,%d\r\n", (int)i, (int)flow_snap.mask[i]);
+    }
+
+    /* [FLOW] 串口 'f'：打印最近 128 拍（1.28 s）的过滤后 mask。
+       格式：FL,<序号>,<mask>,<主段左>,<主段右>,<主段宽度> */
+    if (flow_dump_request)
+    {
+      uint8_t n, i;
+
+      flow_dump_request = 0U;
+      Flow_LogPause(1U);
+      n = Flow_LogCount();
+      printf("FLOWLOG,%d\r\n", (int)n);
+
+      for (i = 0U; i < n; ++i)
+      {
+        uint16_t fm;
+        uint8_t  fl, fr, fw;
+
+        Flow_GetAt(i, &fm, &fl, &fr, &fw);
+        printf("FL,%d,%d,%d,%d,%d\r\n",
+               (int)i, (int)fm, (int)fl, (int)fr, (int)fw);
+      }
+
+      Flow_ClearLog();
+      Flow_LogPause(0U);
+    }
+
     /* [CWDBG 2026-11-22] 直角弯判据事件：丢线沿 / 候选 / fire / 进 corner / 被挡 */
     {
       CwdDebug cd;
@@ -543,10 +620,19 @@ int main(void)
            [HEXDBG 2026-11-22] 前三列改成在线状态：
              state = hx_state（0..4）、total = hx_total 累计角、vrun = V 去抖计数。
            末尾 mask 位置不变，旧解析脚本仍可读。 */
-        printf("HEXSTAT,%d,%d,%d,%d,%d,%d,%lu,%d,%d\r\n",
-               (int)hd.event_cnt, (int)hd.off_r, (int)hd.off_l,
+        printf("HEXSTAT,%d,%d,%d,%d,%d,%d,%d,%lu,%d,%d\r\n",
+               (int)hd.event_cnt, (int)hd.off_r, (int)hd.net10, (int)hd.off_l,
                (int)hd.right, (int)hd.left, (int)hd.center,
                (unsigned long)hd.dist, (int)hd.arm, (int)hd.mask);
+
+        /* [FULLDIST 2026-11-24] 出现过全亮后，每 100 ms 打印一次
+           “本次第一个全亮 -> 当前”的里程（counts，435.7 counts = 1 cm）。 */
+        {
+          uint32_t full_dist;
+
+          if (Control_GetFullDist(&full_dist))
+            printf("FULLDIST,%lu\r\n", (unsigned long)full_dist);
+        }
       }
     }
 		
