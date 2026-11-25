@@ -222,6 +222,11 @@ uint8_t HexLog_Count(void);
 void    HexLog_GetAt(uint8_t i, int16_t *cnt, uint16_t *mask, int16_t *err, uint8_t *flag);
 void    HexLog_Clear(void);
 
+/* [HEX4-TURNBACK 2026-11-25] TURN_IN 转完（30°）仍没看到线时改成反向转回：
+   返回 1 = 本拍刚刚结束反向转回（看到线，或转满放弃）。control 用它在同一拍
+   把 HOLD/补转的旧舵清掉——这一支本身不走 HOLD，HOLD 对其余丢线继续生效。 */
+uint8_t Hex_TakeTurnBackDone(void);
+
 /* ================= [FLOW 2026-11-23] 流动直角弯检测 =================
    第一阶段只并行观察，不接管电机。100 Hz 调用
    Flow_Update(line.mask, line.raw_cnt, line.raw_mask)，主循环用 Flow_PopEvent() 取事件打印 FLOW 行。

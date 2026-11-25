@@ -522,6 +522,34 @@
 #define HEX4_EXIT_LOCKOUT_CM    20.0f
 #define HEX4_EXIT_LOCKOUT_COUNTS ((uint32_t)(HEX4_EXIT_LOCKOUT_CM * COUNTS_PER_CM))
 
+/* [HEX4-TURNBACK 2026-11-25] TURN_IN 转完（30°）仍然没看到线怎么办。
+   原来：进 DRIVING -> 下一拍 line.cnt=0 -> 落到 HOLD（沿同一侧继续加舵到 240），
+   越打越远，看起来像"转过去是空的还在硬拐"。
+   现在：改成**反向转回**——朝 -hx_dir 原地打舵，转到看到线就立刻收手，
+   六边形标记全部清零、把控制权交回方向环；转满和 TURN_IN 一样的角度还没线
+   也一样清零交回，不再硬转。这条分支不经过 HOLD；HOLD 本身不改，
+   对它自己的丢线（45°/60° 弯等）继续生效。
+   1 = 启用反向转回（默认）；0 = 回滚到原来的 DRIVING/HOLD 行为。 */
+#define HEX4_TURNBACK_ENABLE    1
+/* 反向转回结束后 20 cm 内不再武装/入栈：车是掉头往回走的，入口那个 V 马上
+   又会出现在阵列里，不锁就会 TURN_IN -> TURN_BACK 死循环。锁定期内照常巡线，
+   只是不进六边形状态机。 */
+#define HEX4_TURNBACK_LOCKOUT_CM    20.0f
+#define HEX4_TURNBACK_LOCKOUT_COUNTS ((uint32_t)(HEX4_TURNBACK_LOCKOUT_CM * COUNTS_PER_CM))
+
+/* [HEX4-TURNBACK 2026-11-25] 入口"没线"窗口（第二版）：
+   原来只在 TURN_IN 转完的**那一拍**判一次线。现场出现"只亮一个灯停在
+   turnback 点"：那一拍恰好还剩 2 路（线压在 ch5/ch6，error≈0）-> 进 DRIVING；
+   下一拍只剩单灯，被 Sensor_Scan 的 filt 清成 mask=0 / line.cnt=0，
+   于是方向环没线、HOLD 又因为 error≈0 没武装、六边形区间还挡着盲穿
+   -> 目标清零、车停住。其实这就是"转弯完成没找到线"，应该反向转回。
+   现在：只要还在入口完成后的 HEX4_TURNBACK_GRACE_CM 内，连续
+   HEX4_TURNBACK_LOST_TICKS 拍看不到（过滤后的）线，也进 TURN_BACK。
+   出了这个窗口就恢复正常 DRIVING（HOLD/盲穿照旧）。 */
+#define HEX4_TURNBACK_GRACE_CM      15.0f
+#define HEX4_TURNBACK_GRACE_COUNTS  ((uint32_t)(HEX4_TURNBACK_GRACE_CM * COUNTS_PER_CM))
+#define HEX4_TURNBACK_LOST_TICKS    3U    /* 连续丢线拍数：3 拍 = 30 ms，挡断线缺口毛刺 */
+
 /* [2026-11-24] FULLDIST 硬编码：拆成两段短的，只覆盖两次实际失败点。
    早段失败：FULLDIST 813510~819796（LOST 前最后一拍 814975）；
    晚段失败：FULLDIST 851024~861352（LOST 前最后一拍 855615）。

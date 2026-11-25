@@ -718,6 +718,23 @@ static uint8_t Control_Direction(void)
                               line.error, flow_fire, flow_dir, pid_turn);
     }
 
+    /* [HEX4-TURNBACK 2026-11-25] TURN_IN 转完没线 -> 反向转回刚结束：
+       把 HOLD/补转的旧状态清掉，这一拍起把控制权交回方向环。HOLD 本身不改，
+       下一次真的丢线（line.cnt>0 那一拍会重新算 hold_armed/line_hold_turn）
+       照常生效。没有这一步的话，反向转回刚结束、line.cnt 还是 0，
+       HOLD 会拿丢线前的旧舵量再沿原方向补 16 拍，等于把刚反回来的角度打回去。 */
+    if (Hex_TakeTurnBackDone() != 0U)
+    {
+        line_hold_ticks = 0U;
+        line_hold_turn  = 0.0f;
+        hold_armed      = 0U;
+        rec2_armed      = 0U;
+        rec2_done       = 1U;
+        rec2_ticks      = 0U;
+        rec2_yaw        = 0.0f;
+        rec2_pivot      = 0U;
+    }
+
     /* [BLIND-HEX-COOLDOWN 2026-11-23] 六边形刚出栈：清掉可能遗留的盲线状态，
        并锁 20 拍，让方向环先尝试抓线；这 20 拍内不启动新的盲穿。 */
     {

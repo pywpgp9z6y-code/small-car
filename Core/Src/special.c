@@ -1762,15 +1762,18 @@ HexOutput Hex_Update(HexState *h,
      老：第一次 V 就入栈；之后**不看 V**，走够 10 cm 就原地转 30°；出口不打舵。
      新：第一次 V 只"武装"并回正；必须在 10~20 cm 内真的再看到**同侧** V
          且大误差方向一致才进入；出口净角到 320~340° 强制出栈，按入口同方向打 30°。
-   状态：0=IDLE 1=ARMED 2=TURN_IN 3=DRIVING 4=TURN_OUT
+   状态：0=IDLE 1=ARMED 2=TURN_IN 3=DRIVING 4=TURN_OUT 5=TURN_BACK
    事件码（打印 HEX,<event>）：4=武装 5=进入 6=进弯转完 8=解除 9=出口 10=出弯转完
                               12=DRIVING 中看到 V（第二字段 = 当前净角）
                               13=V1 后的 V（第二字段 = 距 V1 的里程，手推诊断用）
                               14=异侧 V 否决（HEX4_OPP_VETO=1 时）
                               17=净角到 320° 强制出栈
                               18=反向回落 >120° 且回 ±20° 强制出栈
-                              19=ARMED 时 FLOW 同侧直角弯否决六边形入口 */
-static uint8_t  hx_state;
+                              19=ARMED 时 FLOW 同侧直角弯否决六边形入口
+                              20=TURN_IN 转完或入口窗口内没线，开始反向转回
+                              21=反向转回看到线，标记清零后交回方向环
+                              22=反向转回没线（转满放弃），标记清零后交回方向环 */
+static uint8_t  hx_state;        /* 0=IDLE 1=ARMED 2=TURN_IN 3=DRIVING 4=TURN_OUT 5=TURN_BACK */
 static int8_t   hx_dir;          /* 记录的转向方向：+1 左 / -1 右 */
 static int8_t   hx_err1;         /* V1 时的大误差方向（可能为 0） */
 static int8_t   hx_side;         /* 当前 V 的侧别 */
@@ -1786,6 +1789,13 @@ static float    hx_yaw;          /* 本次打舵累计角度 */
 static float    hx_total;        /* 绕六边形累计转角（绝对值，诊断用） */
 static float    hx_net;          /* [HEX4-NET] 有方向净转角，从入口 30° 开始累计 */
 static float    hx_net_peak;     /* [HEX4-NET] hx_net 的峰值，用于反向回落判断 */
+#if (HEX4_TURNBACK_ENABLE == 1)
+static float    hx_turnback_deg; /* [HEX4-TURNBACK] 反向转回目标角 = TURN_IN 实际转过的角 */
+#endif
+static uint8_t  hx_turnback_done;/* [HEX4-TURNBACK] 1 = 本拍刚结束反向转回（给 control 清 HOLD 用） */
+#if (HEX4_TURNBACK_ENABLE == 1)
+static uint8_t  hx_drive_lost;   /* [HEX4-TURNBACK] 入口后连续没线的拍数（只在入口窗口内累计） */
+#endif
 static uint16_t hx_straight;     /* 回正剩余拍数 */
 static float    hx_turn_at_v1;   /* V1 那一拍方向环的舵量（回正用） */
 static uint16_t hx_seq_last;     /* 上一次已入队的事件序号（用于把事件推进环形缓冲） */
@@ -1927,6 +1937,13 @@ void Hex4_Reset(void)
     hx_total      = 0.0f;
     hx_net        = 0.0f;
     hx_net_peak   = 0.0f;
+#if (HEX4_TURNBACK_ENABLE == 1)
+    hx_turnback_deg  = 0.0f;
+#endif
+    hx_turnback_done = 0U;
+#if (HEX4_TURNBACK_ENABLE == 1)
+    hx_drive_lost    = 0U;
+#endif
     hx_straight   = 0U;
     hx_turn_at_v1 = 0.0f;
     hx_seq_last   = 0U;
@@ -1952,7 +1969,7 @@ void Hex_GetDebug(const HexState *h, HexDebug *d)
     d->arm = (uint16_t)h->v_prev;
 
     /* [HEXDBG 2026-11-22] 前三列原来是 0，现在借用来在线看状态机：
-       event_cnt = hx_state（0..4）、off_r = hx_total（绝对值）、
+       event_cnt = hx_state（0..5）、off_r = hx_total（绝对值）、
        off_l = hx_vrun，net10 = hx_net（有方向净角 ×10）。
        串口 HEXSTAT 行可直接看到净角有没有累计、有没有反向回落。 */
     d->event_cnt = (uint16_t)hx_state;
@@ -1973,6 +1990,83 @@ static void Hex_ClearCornerWatch(CornerState *c)
     c->cw_wide   = 0U;
     c->cw_ticks  = 0U;
     c->cw_dark   = 0U;
+}
+
+#if (HEX4_TURNBACK_ENABLE == 1)
+/* [HEX4-TURNBACK 2026-11-25] 本拍有没有看到线：用过滤后的 mask 判。
+   单路坏点已经在 Sensor_Scan 里被清成"无线"，所以 mask != 0 就代表至少 2 路压线，
+   不会因为一路悬空/漏读就把反向转回提前结束。 */
+static uint8_t Hex_LineSeen(uint16_t mask)
+{
+    return (uint8_t)((mask != 0U) ? 1U : 0U);
+}
+
+/* [HEX4-TURNBACK 2026-11-25] 反向转回结束（看到线 / 转满放弃）：
+   六边形标记全部清零，交回方向环；HOLD 逻辑本身不动，只把"刚结束"这件事
+   告诉 control（Hex_TakeTurnBackDone），让它在同一拍把旧的 HOLD/补转舵清掉，
+   避免反向转回刚结束又被 HOLD 按旧方向打回去。
+   lock_until = 结束里程 + 锁存距离：车是掉头往回走的，入口那个 V 马上又会
+   出现在阵列里，不锁就会 TURN_IN -> TURN_BACK 死循环。 */
+static void Hex_TurnBackExit(HexState *h, CornerState *corner, uint32_t lock_until)
+{
+    hx_state       = 0U;
+    hx_dir         = 0;
+    hx_err1        = 0;
+    hx_side        = 0;
+    hx_vprev       = 0U;
+    hx_vrun        = 0U;
+    hx_vrun_side   = 0;
+    hx_vl_raw_prev = 0U;
+    hx_vr_raw_prev = 0U;
+    hx_v1_dist     = 0U;
+    hx_t0          = 0U;
+    hx_yaw         = 0.0f;
+    hx_total       = 0.0f;
+    hx_net         = 0.0f;
+    hx_net_peak    = 0.0f;
+    hx_straight    = 0U;
+    hx_turn_at_v1  = 0.0f;
+    hx_turnback_deg  = 0.0f;
+    hx_turnback_done = 1U;
+    hx_drive_lost    = 0U;
+
+    /* 老 Hex_Update 的"在栈"标记也一起清，避免 HEXSTAT / 后续逻辑残留 */
+    h->zone       = 0U;
+    h->v_stack    = 0U;
+    h->hex_yaw    = 0.0f;
+    h->half_done  = 0U;
+    h->full_done  = 0U;
+    h->zone_dist  = 0U;
+    h->v_active   = 0U;
+    h->v_yaw      = 0.0f;
+    h->v_prev     = 0U;
+    h->event_cnt  = 0U;
+    h->arm_ticks  = 0U;
+    h->turn_ticks = 0U;
+
+    hex_zone_flag     = 0U;
+    hx_exit_lock_dist = lock_until;
+
+#if (HEX4_ENTRY_ONLY == 1)
+    hx_lockout_dist = 0U;
+#endif
+#if (HEX4_FLOW_VETO == 1)
+    hx_flow_veto_latch = 0U;
+    hx_flow_veto_dir   = 0;
+#endif
+
+    Hex_ClearCornerWatch(corner);
+}
+#endif /* HEX4_TURNBACK_ENABLE */
+
+/* [HEX4-TURNBACK 2026-11-25] 一次性取"反向转回刚结束"：control 在 Hex_Update4
+   之后调用，用它在同一拍清掉 HOLD/补转的旧舵。功能关闭时恒为 0。 */
+uint8_t Hex_TakeTurnBackDone(void)
+{
+    uint8_t done = hx_turnback_done;
+
+    hx_turnback_done = 0U;
+    return done;
 }
 
 HexOutput Hex_Update4(HexState *h,
@@ -2363,6 +2457,46 @@ HexOutput Hex_Update4(HexState *h,
         if (((hx_yaw * hx_dir) >= (HEX4_TURN_DEG - HEX4_TURN_TOL)) ||
             ((h->dist - hx_t0) > HEX4_TURN_MAX_COUNTS))
         {
+#if (HEX4_TURNBACK_ENABLE == 1)
+            /* [HEX4-TURNBACK 2026-11-25] 先把"实际转过的角"记下来：
+               没线时用它当反转目标；有线进 DRIVING 后，入口窗口内丢线也用它。 */
+            {
+                float done = (hx_yaw >= 0.0f) ? hx_yaw : -hx_yaw;
+
+                /* 反转到和刚才实际转过的角差不多就停；陀螺不可用时退回 30° */
+                hx_turnback_deg = (done >= HEX4_TURN_TOL) ? done : HEX4_TURN_DEG;
+                if (hx_turnback_deg > HEX4_TURN_DEG)
+                    hx_turnback_deg = HEX4_TURN_DEG;
+            }
+            hx_drive_lost = 0U;
+
+            /* 30° 打完了，但这一拍阵列里没有线（mask 就是 control 传进来的
+               line.mask，单灯/坏点已经被 Sensor_Scan 的 filt 清成 0）：
+               说明这个入口的 30° 转过去是空的（误判 / 转过头）。
+               不再进 DRIVING（下一拍 line.cnt=0 就会落到 HOLD，HOLD 会沿同一侧
+               继续加舵，越走越远），改成反向转回，转到看到线就交回方向环。
+               反向转回自己出舵（speed=0 + have_control=1），control 里的 HOLD
+               因为 hex_pivot_active=1 被跳过，这条分支不走 HOLD。 */
+            if (Hex_LineSeen(mask) == 0U)
+            {
+                hx_state    = 5U;               /* TURN_BACK */
+                hx_yaw      = 0.0f;
+                hx_t0       = h->dist;
+                hx_net      = 0.0f;
+                hx_net_peak = 0.0f;
+
+                /* 本拍就开始反向出舵：否则这一拍 have_control=0，
+                   control 里的 hex_pivot_active 还是 0，HOLD 会趁机按旧舵打一拍。 */
+                out.turn         = -(float)hx_dir * HEX4_TURN_RATE;
+                out.speed_cmd    = 0.0f;
+                out.have_control = (HEX_MODE == 2U) ? 1U : 0U;
+
+                h->dbg_event = 20U;             /* 20 = 转完没线，开始反向转回 */
+                h->dbg_dist  = h->dist;
+                ++h->evt_seq;
+                break;
+            }
+#endif
 #if (HEX4_ENTRY_ONLY == 1)
             /* [HEX4-ENTRYONLY] 只做入口 30°：完成后直接交回方向环，
                不再进 DRIVING，不再等出口 V，也不做 TURN_OUT。 */
@@ -2374,6 +2508,9 @@ HexOutput Hex_Update4(HexState *h,
 #else
             hx_state = 3U;                      /* DRIVING */
             hx_total = 0.0f;
+#if (HEX4_TURNBACK_ENABLE == 1)
+            hx_t0    = h->dist;                 /* [HEX4-TURNBACK] 入口丢线窗口从这里算 */
+#endif
 #endif
 
             h->dbg_event = 6U;                  /* 6 = 进弯转完 */
@@ -2387,7 +2524,89 @@ HexOutput Hex_Update4(HexState *h,
         out.have_control = (HEX_MODE == 2U) ? 1U : 0U;
         break;
 
+#if (HEX4_TURNBACK_ENABLE == 1)
+    case 5U:    /* TURN_BACK：反向转回找线（本分支不走 HOLD） */
+        /* [HEX4-TURNBACK 2026-11-25] 朝 -hx_dir 原地打舵，把刚才那 30° 收回来：
+           1) 本拍看到线 -> 立刻收手，六边形标记清零，交回方向环（HEX,21）；
+           2) 反转到 TURN_IN 实际转过的角还没线 -> 同样清零交回（HEX,22），
+              不再硬转，后面交给正常的丢线流程（HOLD/盲穿/停车）。
+           出舵期间 speed=0、have_control=1 => control 的 hex_pivot_active=1，
+           HOLD 块整段被跳过，不会一边反向转一边又被 HOLD 往正方向拉。 */
+        if (Hex_LineSeen(mask) != 0U)
+        {
+            Hex_TurnBackExit(h, corner, h->dist + HEX4_TURNBACK_LOCKOUT_COUNTS);
+
+            h->dbg_event = 21U;                 /* 21 = 反向转回看到线，交回方向环 */
+            h->dbg_dist  = h->dist;
+            ++h->evt_seq;
+            break;
+        }
+
+        if (gyro_ok)
+            hx_yaw += gyro_z * 0.01f;
+
+        if (((hx_yaw * (float)(-hx_dir)) >= (hx_turnback_deg - HEX4_TURN_TOL)) ||
+            ((h->dist - hx_t0) > HEX4_TURN_MAX_COUNTS))
+        {
+            Hex_TurnBackExit(h, corner, h->dist + HEX4_TURNBACK_LOCKOUT_COUNTS);
+
+            h->dbg_event = 22U;                 /* 22 = 反向转回没线，转满放弃 */
+            h->dbg_dist  = h->dist;
+            ++h->evt_seq;
+            break;
+        }
+
+        out.turn         = -(float)hx_dir * HEX4_TURN_RATE;
+        out.speed_cmd    = 0.0f;                /* 原地转 */
+        out.have_control = (HEX_MODE == 2U) ? 1U : 0U;
+        break;
+#endif
+
     case 3U:    /* DRIVING：交回方向环，累计有方向净转角 */
+#if (HEX4_TURNBACK_ENABLE == 1)
+        /* [HEX4-TURNBACK 2026-11-25] 入口窗口内丢线也算"转弯完成没找到线"：
+           TURN_IN 那一拍可能还剩 2 路（线正压在中心，error≈0），下一拍才变单灯，
+           单灯被 filt 清成 mask=0。此时已经进 DRIVING：方向环没线、HOLD 又因为
+           error≈0 没武装、六边形区间还挡着盲穿 -> 目标清零、车停住
+           （现场就是"只亮一个灯停在 turnback 点"）。这里改成就地反向转回。
+           丢线要连续 HEX4_TURNBACK_LOST_TICKS 拍才算，避免断线缺口毛刺误触发。 */
+        if ((hx_turnback_deg > 0.0f) &&
+            ((h->dist - hx_t0) <= HEX4_TURNBACK_GRACE_COUNTS))
+        {
+            if (Hex_LineSeen(mask) == 0U)
+            {
+                if (hx_drive_lost < 250U)
+                    ++hx_drive_lost;
+
+                if (hx_drive_lost >= HEX4_TURNBACK_LOST_TICKS)
+                {
+                    hx_state      = 5U;         /* TURN_BACK */
+                    hx_yaw        = 0.0f;
+                    hx_t0         = h->dist;
+                    hx_drive_lost = 0U;
+                    hx_net        = 0.0f;
+                    hx_net_peak   = 0.0f;
+
+                    out.turn         = -(float)hx_dir * HEX4_TURN_RATE;
+                    out.speed_cmd    = 0.0f;
+                    out.have_control = (HEX_MODE == 2U) ? 1U : 0U;
+
+                    h->dbg_event = 20U;         /* 20 = 转完没线，开始反向转回 */
+                    h->dbg_dist  = h->dist;
+                    ++h->evt_seq;
+                    break;
+                }
+            }
+            else
+            {
+                hx_drive_lost = 0U;
+            }
+        }
+        else
+        {
+            hx_turnback_deg = 0.0f;             /* 出了窗口就不再算入口没线 */
+        }
+#endif
         if (rising)
         {
             h->dbg_event = 12U;
