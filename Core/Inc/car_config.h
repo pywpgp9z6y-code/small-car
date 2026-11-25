@@ -100,7 +100,7 @@
    限速，弯里用，直道（|err|<1.2）完全不受影响。 */
 #define BEND_TURN_MAX           300.0f   /* turn 上限；300 时外轮 600、内轮 0（平均不变） */
 #define BEND_TURN_SLEW          45.0f    /* 每拍最大变化；45 -> 5~6 拍到 250 */
-#define BEND_DAMP_K             0.25f    /* 陀螺阻尼；比直道 0.4 小，弯里不轻易收舵 */
+#define BEND_DAMP_K             0.30f    /* 陀螺阻尼；比直道 0.4 小，弯里不轻易收舵 */
 #define BEND_SPEED_MAX          260.0f   /* 弯里限速；260 下 45° 需要 ~411°/s，300 舵够 */
 
 /* ---- 直角弯模式（[ARC 2026-11-18]） ----
@@ -127,12 +127,12 @@
                                             让电机主动倒转，直接抵消拖拽，不受电压/地面影响。
                                             -70 是以前 PIVOT-C 验证过的值。
                                             调法：转过头/切内道 -> -50；转不够 -> -90。 */
-#define ARC_LEAD_DEG            7.0f     /* 提前这么多度就断电，靠惯性走完。
+#define ARC_LEAD_DEG            9.0f     /* 提前这么多度就断电，靠惯性走完。
                                             246°/s 断电后还会滑 5~8°，不提前就会转过头。 */
 
 /* [ARC2 2026-11-21] 弧线断电后的航向收尾。
    ARC_SETTLE_ENABLE = 0 就是回滚：断电后直接交回巡线（旧行为，一行开关）。 */
-#define ARC_SETTLE_ENABLE       1        /* 1 = 断电后先闭环补角，再交回巡线 */
+#define ARC_SETTLE_ENABLE       0        /* 1 = 断电后先闭环补角，再交回巡线 */
 #define ARC_SETTLE_K            2.0f     /* 补角增益：turn = K × 剩余角度（°/°） */
 #define ARC_SETTLE_KD           0.10f    /* 角速度阻尼：进收尾那一拍车还在 ~300°/s 旋转，
                                             只有 P 项会继续给它加正舵。减去 KD×ω 才刹得住。 */
@@ -293,7 +293,7 @@
                                             出弯斜坡从这个速度起，150 -> 300 用 150 ms。
                                             原来是 0：那是 pivot 停车方案的起点，
                                             但 ARC2 出弯时车还有 150，从 0 起会先急刹一下。 */
-#define CORNER_RAMP_TICKS       15U      /* 150 ms */
+#define CORNER_RAMP_TICKS       8U//15U      /* 150 ms */
 #define CORNER_YAW_EXIT         70.0f
 #define CORNER_MIN_TICKS        12U      /* 120 ms（pivot 方案下已不使用） */
 #define CORNER_MAX_TICKS        200U     /* [GND 2026-11-14] 80->200：实测 ω≈57°/s，转 82° 要 144 拍；
@@ -304,7 +304,7 @@
                                             时间制 0.4 s 在 BASE 120 下 = 11 cm，
                                             比锯齿段的角间距（15~20 cm）还长，会漏弯。 */
 #define CORNER_COOLDOWN_COUNTS  ((uint32_t)(CORNER_COOLDOWN_CM * COUNTS_PER_CM))
-#define CORNER_RAMP_TICKS       15U      /* 150 ms */
+#define CORNER_RAMP_TICKS       8U//15U      /* 150 ms */
 
 /* ---- 原地 pivot 过弯（[PIVOT 2026-11-14] 新增） ----
    speed_cmd 清零，两轮等幅反向 => 绕两轮中点自转。

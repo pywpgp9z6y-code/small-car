@@ -13,6 +13,9 @@ static uint8_t  cw_pend;                   /* 1 = 已看到全亮，等丢线确
 static uint16_t cw_pend_wait;              /* 等确认已经过的拍数（超时作废） */
 static uint8_t  corner_gave_up;            /* [LOST3] 直角弯补转 20° 后仍无线 */
 
+/* [ARC-RATE 2026-11-25] 陀螺角速度环的上一拍修正量（限斜率用） */
+static float    arc_rate_trim;
+
 /* [FULLDIST 2026-11-24] 诊断：本次运行的第一个“全亮”（>=10 路亮）到当前的距离。
    cw_full_active 只用来找“进入全亮”的上升沿；cw_full_valid 一旦置 1，
    起点就固定不动，后面再出现全亮也不重置。 */
@@ -118,6 +121,7 @@ void Corner_Reset(CornerState *c)
     cw_pend      = 0U;      /* [CW4] 丢线确认状态也清 */
     cw_pend_wait = 0U;
     corner_gave_up = 0U;    /* [LOST3] 直角弯补转放弃标志 */
+    arc_rate_trim  = 0.0f;  /* [ARC-RATE] */
 
     cw_full_valid  = 0U;    /* [FULLDIST] */
     cw_full_active = 0U;
@@ -251,6 +255,7 @@ static void Corner_Enter(CornerState *c, float dir)
     c->last_valid_mask = 0U;
     c->arc_ticks = 0U;      /* [ARC 2026-11-18] */
     c->arc_line_ticks = 0U;
+    arc_rate_trim = 0.0f;   /* [ARC-RATE] 新弯从 0 开始修正 */
 }
 
 #if 0
@@ -1132,6 +1137,31 @@ float Corner_Update(CornerState *c,
            300 / -70 时：Δv = 370 counts/10ms -> ω = 304°/s，90° 约 0.30 s，半径约 5 cm。 */
         *speed_cmd = (ARC_OUTER_SPEED + ARC_INNER_SPEED) * 0.5f;
         turn_r     = (ARC_OUTER_SPEED - ARC_INNER_SPEED) * 0.5f;
+
+#if (ARC_RATE_LOOP_ENABLE == 1)
+        /* [ARC-RATE 2026-11-25] 陀螺角速度内环：只改差速，不改中心速度。
+           w_des 用计划差速反算；实测 w = dir×gyro_z（带方向）。
+           先限幅再限斜率：打滑时最多多给 ±TRIM_MAX，不会把差速推爆。 */
+        if (gyro_ok)
+        {
+            float w_des = turn_r * OMEGA_PER_TURN;
+            float trim  = ARC_RATE_KP * (w_des - (float)c->dir * gyro_z);
+
+            if (trim >  ARC_RATE_TRIM_MAX) trim =  ARC_RATE_TRIM_MAX;
+            if (trim < -ARC_RATE_TRIM_MAX) trim = -ARC_RATE_TRIM_MAX;
+            if (trim > arc_rate_trim + ARC_RATE_TRIM_SLEW)
+                trim = arc_rate_trim + ARC_RATE_TRIM_SLEW;
+            if (trim < arc_rate_trim - ARC_RATE_TRIM_SLEW)
+                trim = arc_rate_trim - ARC_RATE_TRIM_SLEW;
+
+            arc_rate_trim = trim;
+            turn_r += trim;
+        }
+        else
+        {
+            arc_rate_trim = 0.0f;
+        }
+#endif
         /* 出口①：出弯角度到了（提前 ARC_LEAD_DEG 断电，让惯性把剩下的几度走完）。
            304°/s 下 90° 只要 0.30 s，断电后还会滑转 5~8°，所以必须提前。
            陀螺掉了就没有角度反馈，用 40 拍（0.4 s ≈ 122°）兜底。

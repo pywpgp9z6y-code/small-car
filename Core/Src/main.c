@@ -500,11 +500,11 @@ int main(void)
     {
       FlowEvent fe;
 
-      while (Flow_PopEvent(&fe))
-        printf("FLOW,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\r\n",
+      while (Flow_PopEvent(&fe));
+        /*printf("FLOW,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\r\n",
                (int)fe.type, (int)fe.dir, (int)fe.new_mask, (int)fe.run_mask,
                (int)fe.run_l, (int)fe.run_r, (int)fe.prev_l, (int)fe.prev_r,
-               (int)fe.width_jump, (int)fe.new_l_cnt, (int)fe.new_r_cnt);
+               (int)fe.width_jump, (int)fe.new_l_cnt, (int)fe.new_r_cnt);*/
     }
 
     /* [FLOW-DIAG] 为什么 Flow 的 prev 被清掉：
@@ -513,11 +513,11 @@ int main(void)
     {
       FlowDiag fd;
 
-      while (Flow_PopDiag(&fd))
-        printf("FLOWGAP,%d,%d,%d,%d,%d,%d,%d\r\n",
+      while (Flow_PopDiag(&fd));
+        /*printf("FLOWGAP,%d,%d,%d,%d,%d,%d,%d\r\n",
                (int)fd.reason, (int)fd.raw_cnt, (int)fd.raw_mask,
                (int)fd.prev_mask, (int)fd.cur_mask,
-               (int)fd.prev_l, (int)fd.prev_r);
+               (int)fd.prev_l, (int)fd.prev_r);*/
     }
 
     /* [FLOW-SNAP 2026-11-23] 检测到左/右直角弯后自动打印 1.28 s 窗口。
@@ -529,7 +529,7 @@ int main(void)
     {
       uint8_t i;
 
-      printf("FLOWSNAP,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\r\n",
+      /*printf("FLOWSNAP,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\r\n",
              (int)flow_snap.num, (int)flow_snap.event.type, (int)flow_snap.event.dir,
              (int)flow_snap.event.new_mask, (int)flow_snap.event.run_mask,
              (int)flow_snap.event.run_l, (int)flow_snap.event.run_r,
@@ -538,12 +538,12 @@ int main(void)
              (int)flow_snap.event.new_l_cnt, (int)flow_snap.event.new_r_cnt);
 
       for (i = 0U; i < flow_snap.num; ++i)
-        printf("FLW,%d,%d\r\n", (int)i, (int)flow_snap.mask[i]);
+        printf("FLW,%d,%d\r\n", (int)i, (int)flow_snap.mask[i]);*/
     }
 
     /* [FLOW] 串口 'f'：打印最近 128 拍（1.28 s）的过滤后 mask。
        格式：FL,<序号>,<mask>,<主段左>,<主段右>,<主段宽度> */
-    if (flow_dump_request)
+ /*   if (flow_dump_request)
     {
       uint8_t n, i;
 
@@ -565,7 +565,7 @@ int main(void)
       Flow_ClearLog();
       Flow_LogPause(0U);
     }
-
+*/
     /* [CWDBG 2026-11-22] 直角弯判据事件：丢线沿 / 候选 / fire / 进 corner / 被挡 */
     {
       CwdDebug cd;
