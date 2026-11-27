@@ -185,6 +185,19 @@ void Hex_AddDistance(HexState *h, uint32_t counts);
 
 /* [TURNBIAS 2026-11-18] 1 = 当前处于六边形区间（转向增益可放大） */
 uint8_t Hex_ZoneActive(void);
+
+/* [ARMED-COAST 2026-11-27] 1 = 六边形状态机处于 ARMED：
+   已经看到第一次 V（HEX,4），正在走 HEX4_ARM_DIST_CM(9 cm) 等确认，
+   还没有进入 TURN_IN。
+   **关键语义**：这段时间车其实还在按普通巡线走，**人不在六边形内部**，
+   后面既没有 60° 顶点，也没有"内轮要反转"的需求。所以 control 里所有
+   "六边形内部"的假设在这里都不成立 —— 最典型的就是 HOLD：它是为
+   "45°/60° 弯丢线、需要继续往弯里加舵到 TURN_MAX"设计的，
+   在 ARMED 期接管只会把车朝 V 的方向越带越偏，30° 打舵又叠加在错误姿态上。
+   control 用这个标志在丢线时改走"冻结最后一拍舵 + 保持车速"的滑行，
+   让 9 cm 正常走完，由状态机自己判 TURN_IN 还是解除武装。
+   注意它与 Hex_ZoneActive() 不是同一个东西：ARMED 期 zone 已经是 1。 */
+uint8_t Hex_IsArmed(void);
 HexOutput Hex_Update(HexState *h,
                      CornerState *corner,
                      uint8_t center,

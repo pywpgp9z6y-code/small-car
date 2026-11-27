@@ -172,7 +172,7 @@
 /* ---- 断线区斜穿（[BLIND 2026-11-18]） ----
    不是直角弯/六边形的场合丢线时，按固定角度斜穿过去找线：
    tan = 15/65 -> 13.0°，路程 = √(15²+65²) = 66.7 cm。 */
-#define BLIND_ANGLE_DEG         24.78f   /* [BLIND 2026-11-22] 横向 300 mm / 纵向 650 mm ->
+#define BLIND_ANGLE_DEG         22.88f   /* [BLIND 2026-11-22] 横向 300 mm / 纵向 650 mm ->
                                             atan(300/650) = 24.775° */
 #define BLIND_DIST_CM           71.6f    /* [BLIND 2026-11-22] 斜穿路程 sqrt(650²+300²) = 715.9 mm */
 #define BLIND_DIST_COUNTS       ((uint32_t)(BLIND_DIST_CM * COUNTS_PER_CM))
@@ -744,6 +744,59 @@
    FLOW_AUTO_DUMP=0 可关掉自动抓取，只保留 FLOW 事件行。 */
 #define FLOW_AUTO_DUMP          1
 #define FLOW_SNAP_DELAY_TICKS   10U      /* 事件后再抓 10 拍（100 ms），让窗口包含触发后的状态 */
+
+/* ---- [FINISH3 2026-11-27] 50 m 后终线识别停车 ----
+   逻辑：
+   - 里程不到 FINISH_ARM_MM（50 m）之前，完全不做终线识别；
+   - 过了 50 m，第一次出现"12 路全亮"就当终点线：记下里程；
+   - 之后保持正常速度再走 FINISH_STOP_DIST_MM（30 cm），然后 Car_Stop。
+   为什么 50 m：第一圈回发车区约 24.6 m（标称）会被挡住；50 m 之后的第一根
+   横条就是最后一次经过发车区。若实车两圈里程不足 50 m（跑完两圈不停），
+   把 FINISH_ARM_MM 降到 47000 再试；若提前停了就往上加。
+   里程用左右轮编码器累计（mm），只做"闸门"和"最后 30 cm"两个短距离判断。
+
+   可选保险：若实车在闸门后仍被弯道全亮误触发，把 FINISH_PULSE_RATE_EN 改 1
+   （认线那一拍要求 |gyro_z| < FINISH_PULSE_RATE = 60°/s，即必须正在走直线）。
+   回滚：FINISH_ENABLE 改 0。 */
+#define FINISH_ENABLE            1
+#define FINISH_ARM_MM            50000.0f  /* 前 50 m 不做终线识别 */
+#define FINISH_STOP_DIST_MM      300.0f    /* 认出终线后再走 30 cm 停车 */
+#define FINISH_LIT_CNT           11U       /* 全亮判据：>=11/12 路 */
+#define FINISH_LIT_TICKS         1U        /* 连续几拍算数（10 ms/拍） */
+#define FINISH_PULSE_RATE_EN     0         /* 1 = 启用"走直线"附加条件 */
+#define FINISH_PULSE_RATE        60.0f     /* 启用时要求 |gyro_z| < 该值（°/s） */
+
+/* ---- [POST 2026-11-27] 终点后的收尾小任务 ----
+   触发：FINISH 逻辑"认出终线后再走 FINISH_STOP_DIST_MM"走完那一刻，不再直接
+   Car_Stop，而是依次执行：
+     1) 原地停 POST_WAIT_TICKS 拍（150 拍 = 1.5 s）；
+     2) 原地自旋 POST_SPIN_DEG（180°，陀螺闭环，左转）；
+     3) 半速巡线直行（POST_SPEED），直到 12 路全亮（POST_LIT_CNT）→ 立刻停，
+        让车停在发车区横条上、12 个光电管全压在线上；
+        兜底：巡线超过 POST_FOLLOW_MAX_TICKS 或 POST_FOLLOW_MAX_MM 还没全亮就停。
+   这段在 Control_Direction 里以 100 Hz 跑，不经过直角弯/六边形状态机。
+   注意：POST_SPEED 默认 100（≈1/3 速）而不是 150，因为识别到全亮后是"滑行"
+   停车（代码禁止反接制动），速度越低滑得越短，才停得住横条；如果停过头就
+   往下调 80，停不到就调 120。
+   回滚：POST_ENABLE 改 0（就恢复成原来的"认出终点线后直接停"）。 */
+#define POST_ENABLE              1
+#define POST_WAIT_TICKS          150U     /* 停 1.5 s（10 ms/拍） */
+#define POST_SPIN_DEG            180.0f   /* 自旋角度，正 = 左转 */
+#define POST_SPIN_TOL            3.0f
+#define POST_SPIN_KICK           42.0f    /* 起步踹一下，破静摩擦 */
+#define POST_SPIN_KICK_TICKS     18U
+#define POST_SPIN_KP             0.6f
+#define POST_SPIN_MIN            30.0f
+#define POST_SPIN_MAX            42.0f
+#define POST_SPIN_TIMEOUT        500U     /* 5 s 还没转完就放弃 */
+#define POST_SPEED               100.0f   /* 巡线速度（BASE 的 1/3） */
+#define POST_TURN_KP             45.0f    /* 每 1 路偏差给多少差速 */
+#define POST_TURN_MAX            80.0f
+#define POST_LIT_CNT             12U      /* 12/12 全亮 */
+#define POST_LIT_TICKS           1U
+#define POST_STOP_TICKS          20U      /* 停车后再保持 0 目标 200 ms */
+#define POST_FOLLOW_MAX_TICKS    800U     /* 8 s 找不到横条就停 */
+#define POST_FOLLOW_MAX_MM       1500.0f  /* 或最多再走 1.5 m */
 
 /* ---- 陀螺 ---- */
 #define GYRO_ALPHA              0.3f

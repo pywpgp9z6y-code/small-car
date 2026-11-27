@@ -103,6 +103,30 @@ static volatile uint8_t lf_center;   /* |err|<2 的拍数 */
 static volatile uint8_t lf_side;     /* 一侧最大连续亮路数 0..6 */
 static volatile uint8_t lf_full;     /* 1 = 出现过一侧 6 路全亮 */
 
+/* [FINISH3 2026-11-27] 45 m 后终线识别停车 */
+#if (FINISH_ENABLE == 1)
+static float    g_odom_mm;      /* 本次发车累计里程（mm，左右轮平均） */
+static float    fin_trig_mm;    /* 认出终线时的里程 */
+static uint8_t  fin_lit;        /* 全亮连续拍数 */
+static uint8_t  fin_active;     /* 1 = 已认出终线，正在走最后 30 cm */
+#endif
+
+/* [POST 2026-11-27] 终点后的收尾任务：停 1.5 s -> 自旋 180° -> 半速巡线到全亮停车 */
+#if (POST_ENABLE == 1)
+#define POST_IDLE   0U
+#define POST_WAIT   1U
+#define POST_SPIN   2U
+#define POST_FOLLOW 3U
+#define POST_HOLD   4U
+
+static uint8_t  post_state;     /* POST_IDLE = 没在跑 */
+static uint16_t post_ticks;     /* 当前状态计时（10 ms/拍） */
+static float    post_yaw0;      /* 自旋起始航向 */
+static float    post_odom0;     /* 巡线起始里程 */
+static uint8_t  post_lit;       /* 全亮连续拍数 */
+static uint8_t  post_hit;       /* 1 = 停在横条上（全亮） */
+#endif
+
 /* ================= 停车 / 发车 ================= */
 
 static void Launch_Reset(void)
@@ -165,6 +189,17 @@ static void Car_Stop(void)
     car.straight.ticks = 0U;
 
     Flow_Reset();          /* [FLOW] 停车/重新发车时清观察窗口 */
+#if (FINISH_ENABLE == 1)
+    /* [FINISH3 2026-11-27] 重新发车：里程清零，重新等 FINISH_ARM_MM（50 m） */
+    g_odom_mm   = 0.0f;
+    fin_trig_mm = 0.0f;
+    fin_lit     = 0U;
+    fin_active  = 0U;
+#endif
+#if (POST_ENABLE == 1)
+    post_state = POST_IDLE;   /* [POST] 停车/重新发车：清掉收尾任务 */
+    post_hit   = 0U;
+#endif
 }
 
 void Control_Start(void)
@@ -365,6 +400,148 @@ static uint8_t FullDistInBlock(uint32_t fd)
     return 0U;
 }
 
+#if (POST_ENABLE == 1)
+/* [POST 2026-11-27] 终点后的收尾任务：停 1.5 s -> 自旋 180° -> 半速巡线到全亮停车。
+   由 FINISH 逻辑（最后 30 cm 走完那一刻）调用，之后在 Control_Direction 里
+   以 100 Hz 接管，直到最后 Car_Stop。 */
+static void Post_Start(void)
+{
+    post_state  = POST_WAIT;
+    post_ticks  = 0U;
+    post_lit    = 0U;
+    post_hit    = 0U;
+    post_yaw0   = Gyro_GetYaw();
+    post_odom0  = g_odom_mm;
+    fin_active  = 0U;          /* 关掉终线逻辑，别在收尾阶段重复触发 */
+    car.speed_cmd = 0.0f;
+    pid_L.target  = 0.0f;
+    pid_R.target  = 0.0f;
+    Motor_SetSpeedGains(PIVOT_KP, PIVOT_KI);
+    printf("[POST] wait 1.5 s, then spin 180\r\n");
+}
+
+/* 返回 1 = 收尾任务接管本拍（Control_Direction 直接返回）。 */
+static uint8_t Post_Update(void)
+{
+    LineSample line;
+    float      yaw;
+    float      yaw_abs;
+    float      err;
+    float      cmd;
+    float      turn;
+
+    if (post_state == POST_IDLE)
+        return 0U;
+
+    switch (post_state)
+    {
+    case POST_WAIT:            /* 1) 原地停 1.5 s */
+        pid_L.target = 0.0f;
+        pid_R.target = 0.0f;
+        car.speed_cmd = 0.0f;
+        if (++post_ticks >= POST_WAIT_TICKS)
+        {
+            post_state = POST_SPIN;
+            post_ticks = 0U;
+            post_yaw0  = Gyro_GetYaw();
+            Motor_SetSpeedGains(PIVOT_KP, PIVOT_KI);
+        }
+        return 1U;
+
+    case POST_SPIN:            /* 2) 原地自旋 180°（同 '2' 原地转，左转） */
+        if (!Gyro_IsOk())
+        {
+            Car_Stop();
+            return 1U;
+        }
+
+        yaw     = Gyro_GetYaw() - post_yaw0;
+        yaw_abs = (yaw >= 0.0f) ? yaw : -yaw;
+        ++post_ticks;
+
+        if ((yaw_abs >= (POST_SPIN_DEG - POST_SPIN_TOL)) ||
+            (post_ticks >= POST_SPIN_TIMEOUT))
+        {
+            pid_L.target = 0.0f;
+            pid_R.target = 0.0f;
+            car.speed_cmd = 0.0f;
+            post_state = POST_FOLLOW;
+            post_ticks = 0U;
+            post_lit   = 0U;
+            post_odom0 = g_odom_mm;
+            Motor_SetSpeedGains(SPEED_KP_DEFAULT, SPEED_KI_DEFAULT);
+            return 1U;
+        }
+
+        if (post_ticks <= POST_SPIN_KICK_TICKS)
+        {
+            cmd = POST_SPIN_KICK;      /* 前 180 ms 硬踹，破静摩擦 */
+        }
+        else
+        {
+            err = POST_SPIN_DEG - yaw_abs;
+            cmd = POST_SPIN_KP * err;
+            if (cmd > POST_SPIN_MAX) cmd = POST_SPIN_MAX;
+            if (cmd < POST_SPIN_MIN) cmd = POST_SPIN_MIN;
+        }
+
+        pid_L.target = -cmd;           /* 左轮反转 = 左转 */
+        pid_R.target =  cmd;
+        car.speed_cmd = 0.0f;
+        return 1U;
+
+    case POST_FOLLOW:          /* 3) 巡线直行，直到 12 路全亮 */
+        Sensor_Scan(&line);
+        ++post_ticks;
+
+        if (line.cnt >= POST_LIT_CNT)
+        {
+            if (post_lit < 0xFFU) ++post_lit;
+        }
+        else
+        {
+            post_lit = 0U;
+        }
+
+        if ((post_lit >= POST_LIT_TICKS) ||
+            (post_ticks >= POST_FOLLOW_MAX_TICKS) ||
+            ((g_odom_mm - post_odom0) >= POST_FOLLOW_MAX_MM))
+        {
+            post_hit = (line.cnt >= POST_LIT_CNT) ? 1U : 0U;
+            pid_L.target = 0.0f;       /* 立刻断输出，靠滑行停住 */
+            pid_R.target = 0.0f;
+            car.speed_cmd = 0.0f;
+            post_state = POST_HOLD;
+            post_ticks = 0U;
+            return 1U;
+        }
+
+        turn = POST_TURN_KP * line.error;
+        if (turn >  POST_TURN_MAX) turn =  POST_TURN_MAX;
+        if (turn < -POST_TURN_MAX) turn = -POST_TURN_MAX;
+
+        car.speed_cmd = POST_SPEED;
+        pid_L.target = POST_SPEED - turn;
+        pid_R.target = POST_SPEED + turn;
+        if (pid_L.target < 0.0f) pid_L.target = 0.0f;
+        if (pid_R.target < 0.0f) pid_R.target = 0.0f;
+        return 1U;
+
+    default:                   /* POST_HOLD：停稳后收尾 */
+        pid_L.target = 0.0f;
+        pid_R.target = 0.0f;
+        car.speed_cmd = 0.0f;
+        if (++post_ticks >= POST_STOP_TICKS)
+        {
+            post_state = POST_IDLE;
+            printf("[POST] stopped, on-line=%u\r\n", (unsigned)post_hit);
+            Car_Stop();
+        }
+        return 1U;
+    }
+}
+#endif
+
 static uint8_t Control_Direction(void)
 {
     LineSample line;
@@ -391,8 +568,49 @@ static uint8_t Control_Direction(void)
         return 0U;
     }
 
+#if (POST_ENABLE == 1)
+    /* [POST 2026-11-27] 终点后的收尾任务（停 1.5 s -> 自旋 180° -> 巡线到全亮）接管 */
+    if (Post_Update())
+        return 0U;
+#endif
+
     /* 1) 12 路 -> 偏差 */
     Sensor_Scan(&line);
+
+#if (FINISH_ENABLE == 1)
+    /* [FINISH3 2026-11-27] 前 FINISH_ARM_MM 不做终线识别；
+       过了 FINISH_ARM_MM（50 m）后第一次"12 路全亮"就是终点线：记里程，再正常速度跑 30 cm 停车。 */
+    if (car.run_flag != 0U)
+    {
+        if (line.cnt >= FINISH_LIT_CNT)
+        {
+            if (fin_lit < 0xFFU)
+                ++fin_lit;
+        }
+        else
+        {
+            fin_lit = 0U;
+        }
+
+        if ((fin_lit == FINISH_LIT_TICKS) &&
+            (fin_active == 0U) &&
+#if (POST_ENABLE == 1)
+            (post_state == POST_IDLE) &&   /* [POST] 收尾任务阶段不再认终线 */
+#endif
+            (g_odom_mm >= FINISH_ARM_MM)
+#if (FINISH_PULSE_RATE_EN == 1)
+            && ((Gyro_IsOk() == 0U) ||
+                ((Gyro_GetZ() > -FINISH_PULSE_RATE) && (Gyro_GetZ() < FINISH_PULSE_RATE)))
+#endif
+            )
+        {
+            fin_active  = 1U;
+            fin_trig_mm = g_odom_mm;
+            printf("[FIN] finish line at %lu mm, +%u mm then stop\r\n",
+                   (unsigned long)g_odom_mm, (unsigned)FINISH_STOP_DIST_MM);
+        }
+    }
+#endif
 
     /* [FLOW 2026-11-23] 流动直角弯观察：只维护窗口和事件队列，不参与控制。
        用过滤后的 line.mask（单路坏点已经在 Sensor_Scan 里变成 0）。
@@ -979,6 +1197,28 @@ static uint8_t Control_Direction(void)
             car.speed_cmd = BASE_SPEED * LINE_HOLD_SPEED_K;
             have_control  = 1U;
         }
+        /* [ARMED-COAST 2026-11-27] ARMED 期丢线：**不许 HOLD 接管**，改走滑行。
+           为什么：ARMED 只是"看到了第一次 V、正在走 9 cm 等确认"，
+           车这时候还在普通巡线上，**并不在六边形内部**——后面没有 60° 顶点，
+           也没有内轮要反转的需求。而 HOLD 是为"45°/60° 弯丢线、要继续往弯里
+           加到 TURN_MAX(250)"设计的：一旦在这里武装，它会沿 V 的方向每拍 +20
+           顶到 250 打满 16 拍（≈11 cm），把车越带越偏；紧接着状态机走满 9 cm
+           进 TURN_IN 再打 30°，等于把 30° 叠加在一个已经被拖歪的姿态上，
+           结果就是"转 30° 后继续转、又扒到线、重新进六边形"。
+           为什么不能只把 HOLD 关掉：ARMED 期 zone=1，盲穿(blind)和 rec2 的 90°
+           补转都被 Hex_ZoneActive() 挡住，HOLD 一关就只剩 have_control=0，
+           目标被清零 -> 车滑行到 LOST_STOP_TICKS(1.2 s) 后 Car_Stop()，
+           而 Car_Stop 会调 Hex_Reset，把六边形状态和里程全清掉。
+           所以这里给一个"定向滑行"：冻结丢线前最后一拍的舵（**不加 LINE_HOLD_SLEW**），
+           速度沿用上面 Corner_Update/限速算好的 car.speed_cmd（不覆盖，保留弯道限速），
+           让剩下几厘米正常走完，把决定权交回状态机自己：
+           走满 9 cm -> TURN_IN -> 看 mask 决定 TURN_BACK 还是 DRIVING。
+           回滚：删掉本分支即可恢复 HOLD 在 ARMED 期接管。 */
+        else if (Hex_IsArmed() != 0U)
+        {
+            turn         = line_hold_turn;   /* 冻结，不加斜率 */
+            have_control = 1U;               /* 速度沿用 car.speed_cmd，不清零 */
+        }
         else if (hold_armed != 0U)
         {
         /* [RECOVER2] 转角从"丢线那一刻"开始累计（HOLD 段也算在内），
@@ -1062,6 +1302,27 @@ static uint8_t Control_Direction(void)
         }
     }
 
+#if (FINISH_ENABLE == 1)
+    /* [FINISH3 2026-11-27] 认出终线后保持正常速度，再走 FINISH_STOP_DIST_MM 停车 */
+    if (fin_active != 0U)
+    {
+        if (have_control != 0U)
+            car.speed_cmd = BASE_SPEED;
+
+        if ((g_odom_mm - fin_trig_mm) >= FINISH_STOP_DIST_MM)
+        {
+#if (POST_ENABLE == 1)
+            /* [POST 2026-11-27] 不直接停：交给收尾任务（停 1.5 s -> 自旋 180° -> 巡线到全亮） */
+            Post_Start();
+#else
+            Car_Stop();
+            printf("[FIN] stopped, odom=%lu mm\r\n", (unsigned long)g_odom_mm);
+            return 0U;
+#endif
+        }
+    }
+#endif
+
     /* 5) 差速 -> 左右目标速度（过弯/正常统一在这里写） */
     if (have_control)
     {        /* [NOSPIN 2026-11-18] 不反转护栏：巡线/六边形弧线阶段，turn 不允许超过
@@ -1107,7 +1368,24 @@ static uint8_t Control_Direction(void)
             }
         }
 #endif
-				if (!corner_was_active && !Corner_IsActive(&corner) && (rec2_pivot == 0U) && (hex_boost_ticks == 0U)) {   /* [PIVOT 2026-11-14] 锁存期允许一侧目标为负（两轮反向） */
+				if (!corner_was_active && !Corner_IsActive(&corner) && (rec2_pivot == 0U) && (hex_boost_ticks == 0U) && (hex_pivot_active == 0U)) {   /* [PIVOT 2026-11-14] 锁存期允许一侧目标为负（两轮反向）。
+   [HEXPIVOT 2026-11-27] 补上 hex_pivot_active：六边形 TURN_IN 的 30° 原地转
+   （out.turn=±45, speed_cmd=0）走的就是这条路。缺这一项时 pid_L = 0-45 = -45
+   会被下面的钳位夹成 0 -> 退化成**单轮转**（估约 37°/s，只有设计值一半，
+   转 30° 要 0.8 s，经常拖到 HEX4_TURN_MAX_CM(12 cm) 兜底才结束），
+   也就是"转不过去、方向环没劲"。
+   补上后两轮反向，恢复设计值：ω = 1.644 × 45 ≈ 74°/s，30° 约 0.41 s / 41 拍；
+   10 ms 采样下每拍 0.74°，过冲 ≤1.5°，远小于 HEX4_TURN_TOL(4°)。
+   前馈输出量级（不是超调）：L = FF_PIVOT_L_REV×45 = 18.0×45 ≈ -810 CCR，
+   R = FF_PIVOT_R×45 = 15.4×45 ≈ +693 CCR。
+   **强度不是新标定**：直角弯 pivot 用的就是同一个数（car_config.h 的
+   PIVOT_TARGET = 45），那旁边的注释记着实测约 80°/s、转 82° 约 1.0 s，
+   与本处算出的 74°/s 基本一致；而且直角弯还额外有 PIVOT_KICK(55)/15 拍的
+   起转脉冲，六边形 TURN_IN 没有这一段。所以补上这一项之后，
+   六边形原地转**只比直角弯 pivot 弱，不会更强**。
+   若现场仍嫌强：调小 car_config.h 的 HEX4_TURN_RATE（45 -> 30，两轮按比例缩小），
+   **不要**改回本条件 —— 改回去恢复的是"一正一反不对称"的退化形态，手感更差。
+   回滚：删掉 && (hex_pivot_active == 0U) 这一项即可。 */
         if (pid_L.target < 0.0f) pid_L.target = 0.0f;
         if (pid_R.target < 0.0f) pid_R.target = 0.0f;
 			}
@@ -1131,12 +1409,20 @@ static uint8_t Control_Direction(void)
    直道轮子自由滚动（负载小），原地转两轮互顶+横刮（负载大 7 倍）。 */
 static uint8_t FF_IsPivotMode(void)
 {
-    return (uint8_t)((car.spin.mode != 0U) ||
-                     (corner.state == CORNER_ST_PIVOT) ||
-                     (corner.state == CORNER_ST_SETTLE) ||
-                     (corner.state == CORNER_ST_RECOVER) ||   /* [RECOVER 2026-11-16] 找线也是原地转 */
-                     (rec2_pivot != 0U) ||        /* [RECOVER2 2026-11-21] 普通丢线的原地补转 */
-                     (hex_pivot_active != 0U));   /* [原地转] 六边形入口原地转也按 pivot 给前馈 */
+    if ((car.spin.mode != 0U) ||
+        (corner.state == CORNER_ST_PIVOT) ||
+        (corner.state == CORNER_ST_SETTLE) ||
+        (corner.state == CORNER_ST_RECOVER) ||   /* [RECOVER 2026-11-16] 找线也是原地转 */
+        (rec2_pivot != 0U) ||        /* [RECOVER2 2026-11-21] 普通丢线的原地补转 */
+        (hex_pivot_active != 0U))    /* [原地转] 六边形入口原地转也按 pivot 给前馈 */
+        return 1U;
+
+#if (POST_ENABLE == 1)
+    if (post_state == POST_SPIN)     /* [POST] 终点后自旋 180° 也是原地转 */
+        return 1U;
+#endif
+
+    return 0U;
 }
 
 static float FF_L(float target)
@@ -1265,6 +1551,10 @@ static uint8_t Control_Speed(void)
     car.straight.dist += (uint32_t)((dL_abs + dR_abs) / 2);
     Corner_AddDistance(&corner, (uint32_t)((dL_abs + dR_abs) / 2));   /* [APPROACH 2026-11-14] */
 
+#if (FINISH_ENABLE == 1)
+    g_odom_mm += (float)((dL_abs + dR_abs) / 2) * (10.0f / COUNTS_PER_CM);   /* [FINISH3] counts -> mm */
+#endif
+
     /* PID 实际使用的速度：保持当前符号（左轮反转计数，所以取负） */
     speed_L = -(float)dL;          /* TIM3 左 */
     speed_R =  (float)dR;          /* TIM4 右 */
@@ -1310,7 +1600,14 @@ static uint8_t Control_Speed(void)
 
         /* 中途卡住：速度接近 0 持续 300 ms，重新脉冲 kick。
            spin / straight 模式不要走这个逻辑，否则会两轮正转把车往前踹。 */
-        if (car.launch.done && !car.spin.mode && !car.straight.mode&&!Corner_IsActive(&corner))
+        if (car.launch.done && !car.spin.mode && !car.straight.mode&&!Corner_IsActive(&corner)
+#if (FINISH_ENABLE == 1)
+            && (fin_active == 0U)      /* [FINISH3] 最后 30 cm 不要 kick */
+#endif
+#if (POST_ENABLE == 1)
+            && (post_state == POST_IDLE)   /* [POST] 收尾任务期间（含停 1.5 s）不要 kick */
+#endif
+            )
         {
             if (speed_L < STALL_SPEED && speed_R < STALL_SPEED)
             {

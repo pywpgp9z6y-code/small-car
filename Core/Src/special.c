@@ -2022,6 +2022,15 @@ static void Hex_ClearCornerWatch(CornerState *c)
     c->cw_dark   = 0U;
 }
 
+/* [ARMED-COAST 2026-11-27] 是否处于 ARMED（看到第一次 V、走 9 cm 等确认）。
+   只暴露状态号，不给 control 任何别的信息：它需要知道的仅仅是
+   "现在还是方向环在开车，六边形没有接管"（详见 special.h 的声明注释）。
+   放在这里而不是 Hex_ZoneActive 旁边，是因为 hx_state 在本文件 1806 行才声明。 */
+uint8_t Hex_IsArmed(void)
+{
+    return (uint8_t)((hx_state == 1U) ? 1U : 0U);
+}
+
 #if (HEX4_TURNBACK_ENABLE == 1)
 /* [HEX4-TURNBACK 2026-11-25] 本拍有没有看到线：用过滤后的 mask 判。
    单路坏点已经在 Sensor_Scan 里被清成"无线"，所以 mask != 0 就代表至少 2 路压线，
