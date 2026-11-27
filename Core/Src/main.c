@@ -438,11 +438,18 @@ int main(void)
         ControlDebug d;
         dbg_last = HAL_GetTick();
         Control_GetDebug(&d);
-       printf("%d,%d,%d,%d,%d,%d,%d,%d\r\n",
+       /* [DIAG400 2026-11-27] 追加 err10 / gyro10 / near_d / turn10：
+          判读：turn_cmd = turn10/10，w_cmd = turn_cmd x 1.644
+                turn 涨而 gyro10 不跟 -> 打滑（抓地，不是方向环）
+                near_d=1 且 err10 持续 >20 -> 折角里舵量不够
+                err10 峰峰 <15 且 turn 不来回翻符号 -> 环稳 */
+       printf("%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\r\n",
                (int)TIM1->CCR1, (int)TIM1->CCR2,
                (int)(d.target_L * 10.0f), (int)(d.target_R * 10.0f),
                (int)d.dL, (int)d.dR,
-               (int)d.speed_L, (int)d.speed_R);
+               (int)d.speed_L, (int)d.speed_R,
+               (int)(d.error * 10.0f), (int)(d.gyro_z * 10.0f),
+               (int)d.near_d, (int)(d.turn * 10.0f));
       }
     }
 

@@ -19,12 +19,12 @@
                                             才被改坏的几个点之一，先退回 3000。 */
 
 /* ---- 直道 / 方向环 ---- */
-#define BASE_SPEED              300.0f    /* [SPEED300 2026-11-21] 150 -> 300（0.69 m/s）。
+#define BASE_SPEED              400.0f    /* [SPEED300 2026-11-21] 150 -> 300（0.69 m/s）。
                                             注意：这一步只做"速度链"，TURN_MAX 还是 120，
                                             300 下的最小转弯半径约 20 cm，45° 弯过不去。
                                             验证请只跑直道（看 CCR 是否落在 438 附近），
                                             弯道等第二步放开转向权限。 */
-#define TURN_MAX                250.0f    /* [SPEED300 2026-11-21] 120 -> 250。
+#define TURN_MAX                300.0f    /* [SPEED300 2026-11-21] 120 -> 250。
                                             几何账：前视 d 处侧偏 3.3 cm 能表达的最小半径
                                             R = d²/(2×3.3)。前视 8 cm 时 R_min = 9.7 cm，
                                             对应 ω = 0.69/0.097 = 7.1 rad/s = 408°/s
@@ -34,7 +34,7 @@
                                             平时 e=5.5 的 turn 上限是 52（不打扰直道）；
                                             区间内 ×2.3 -> 约 120，正好用满内轮=0 的能力。 */
 
-#define CURVE_SLOW              0.3f     /* [CORNER45 2026-11-21] 0 -> 0.3：speed = BASE − 0.3×|turn|。
+#define CURVE_SLOW              0.15f     /* [CORNER45 2026-11-21] 0 -> 0.3：speed = BASE − 0.3×|turn|。
                                             45° 时线扫过阵列只有 ~9.5 拍，TURN_SLEW 20/拍 最多到 190，
                                             而弯里需要 250。降速是为了**多拿几拍**（不是减小半径——
                                             "内轮不反转"约束下 R_min 恒为 8 cm，和速度无关）。
@@ -64,7 +64,7 @@
 #define CORNER_NEAR_ERR         2.0f     /* [SPEED300 2026-11-21] 切短前视的误差门限（路）。
                                             调大 -> 更晚进"弯道模式"，直道更稳；
                                             调小 -> 更早变有力，但直道容易抽。 */
-#define ERR_FILTER_ALPHA        0.30f    /* [CENTER 2026-11-18] 0.25 -> 0.30：折中，
+#define ERR_FILTER_ALPHA        0.40f    /* [CENTER 2026-11-18] 0.25 -> 0.30：折中，
                                             0.25 的延迟让回中更慢 */
 #define OMEGA_KP                0.5f     /* 角速度环增益：turn / (°/s) */
 #define OMEGA_PER_TURN          1.644f   /* 1 单位 turn 对应的角速度，°/s（纯几何） */
@@ -81,7 +81,11 @@
 #define DAMP_K_HEX              0.20f    /* 陀螺阻尼（直道 0.4） */
 #define PURSUIT_L_CM_HEX_NEAR   6.0f     /* 大误差时六边形区间的前视（直道 8.0） */
 #define TURN_MAX_HEX            280.0f   /* 转向上限（直道 250） */
-#define HEX_ZONE_SPEED_MAX      240.0f   /* 六边形区间限速；设 300 等于关闭 */
+#define HEX_ZONE_SPEED_MAX      240.0f   /* 六边形区间限速；设 300 等于关闭。
+                                            [2026-11-27] 400 档也曾提到 320（保持 80% 比例），
+                                            但实测顶点更容易出界，所以**六边形整体按 300 档跑**，
+                                            只在直道/直角弯/折角用 400。
+                                            240/400 = 60%，六边形里是"主动降速通过"。 */
 
 /* ---- [HEXBOOST 2026-11-22] 六边形顶点短暂允许内轮反转 ----
    60° 顶点需要 turn≈380；内轮 0 时 turn 上限只有 speed。
@@ -92,16 +96,52 @@
 #define HEX_BOOST_ERR           2.5f     /* 丢线前/当前 |error| 超过这个才开窗口 */
 #define HEX_BOOST_TICKS         12U      /* 每次窗口 12 拍（120 ms） */
 #define HEX_BOOST_GAP_TICKS     8U       /* 窗口结束后至少隔 8 拍才允许下一次 */
-#define HEX_BOOST_INNER         80.0f    /* 内轮最多 -80（turn = speed + 80） */
+#define HEX_BOOST_INNER         80.0f    /* 内轮最多 -80（turn = speed + 80）。
+                                            [2026-11-27] 试过 120、也试过 hex 脉冲，都无效/有害：
+                                            boost 只抬高 tmax（**上限**），而方向环的需求
+                                            pid_turn = 118 × err_d 根本到不了上限，
+                                            所以加大它无感。已恢复 300 档原值。 */
+
+/* ---- [HEX-PUNCH 2026-11-27] 六边形顶点起转脉冲 ----
+   **为什么加大 HEX_BOOST_INNER 没有效果（已从代码确认）**：
+     boost 只把 tmax（**上限**）抬到 speed + HEX_BOOST_INNER，
+     但 pid_turn 是方向环"要"出来的：
+         pid_turn = G × err_d,   G = 13.3 × v / d²
+     六边形区间 v=320、d=PURSUIT_L_CM_HEX_NEAR=6.0 -> G = 118 每路。
+     要把 turn 做到 460，需要 err_d = 3.9 路 —— 而线滑出阵列之前，
+     滤波后的 err_f 根本到不了这个值。
+     **所以上限从来没被碰到过，抬高上限当然无感。**
+
+   办法（与 ARC_PUNCH / BEND_PUNCH 同一套）：
+     不等比例环把舵"长"出来，直接命令一个短时脉冲。
+       speed 270 / turn 385 -> 外 655 / 内 -115
+       电机实测上限 ~662，所以 655 刚好可达、基本不饱和
+       R = 8×270/385 = 5.6 cm   （60° 顶点需要 ≤ 5.7）
+       ω = 385×1.644 = 633°/s
+
+   与 BEND_PUNCH 的区别：六边形是一整片区间，脉冲要在每个顶点各触发一次，
+   所以用"|error| 越过门限的上升沿"触发，每个顶点只打一次、只持续 8 拍。
+
+   回滚：HEX_PUNCH_ENABLE 改 0，行为与改动前完全一致。 */
+#ifndef HEX_PUNCH_ENABLE
+#define HEX_PUNCH_ENABLE        0        /* [2026-11-27] 1 -> 0：实测"剧烈拉扯"，
+                                            原因是脉冲方向每拍按 turn 符号重算，
+                                            顶点过零时翻转。已改为触发瞬间锁存方向
+                                            （hex_punch_dir），确认稳定后再重开。 */
+#endif
+#define HEX_PUNCH_TICKS         8U       /* 每个顶点脉冲 8 拍 = 80 ms */
+#define HEX_PUNCH_TURN        385.0f     /* 外 655 / 内 -115 */
+#define HEX_PUNCH_SPEED       270.0f     /* 脉冲期间中心速度上限 */
+#define HEX_PUNCH_ERR           2.5f     /* 触发门限：|error| 超过这个值 */
 
 /* ---- [BEND 2026-11-22] 大误差（45° 弯）时的方向环参数 ----
    45° 弯时线扫过阵列只有 ~9.5 拍，需要 turn≈288；直道参数 250/20 拍 打不满。
    这里在 near_d（|err|>2.0，回差 1.2 退出）时切一套更激进的参数 +
    限速，弯里用，直道（|err|<1.2）完全不受影响。 */
-#define BEND_TURN_MAX           300.0f   /* turn 上限；300 时外轮 600、内轮 0（平均不变） */
-#define BEND_TURN_SLEW          45.0f    /* 每拍最大变化；45 -> 5~6 拍到 250 */
+#define BEND_TURN_MAX           350.0f   /* turn 上限；300 时外轮 600、内轮 0（平均不变） */
+#define BEND_TURN_SLEW          60.0f    /* 每拍最大变化；45 -> 5~6 拍到 250 */
 #define BEND_DAMP_K             0.30f    /* 陀螺阻尼；比直道 0.4 小，弯里不轻易收舵 */
-#define BEND_SPEED_MAX          260.0f   /* 弯里限速；260 下 45° 需要 ~411°/s，300 舵够 */
+#define BEND_SPEED_MAX          340.0f   /* 弯里限速；260 下 45° 需要 ~411°/s，300 舵够 */
 
 /* ---- 直角弯模式（[ARC 2026-11-18]） ----
    0 = 老的停车方案：APPROACH → BRAKE → PIVOT → SETTLE → RECOVER
@@ -120,15 +160,172 @@
    -> 外轮 = ARC_OUTER_SPEED（300，不变速）
       内轮 = ARC_INNER_SPEED（-70，倒转）
    Δv = 370 counts/10ms，ω = 304°/s，转 90° 约 0.30 s，半径约 5 cm。 */
-#define ARC_OUTER_SPEED         300.0f   /* 过弯时外轮保持的速度（= BASE） */
-#define ARC_INNER_SPEED        (-70.0f)  /* [ARC2 2026-11-21] 内轮目标：负 = 主动倒转。
+#define ARC_OUTER_SPEED         400.0f   /* 过弯时外轮保持的速度（= BASE） */
+#define ARC_INNER_SPEED        (-100.0f)  /* [ARC2 2026-11-21] 内轮目标：负 = 主动倒转。
                                             为什么不用 0：内轮是被车拖着走的，反向脉冲
                                             再大也只是和地面抢轮子（实测 -40 都没明显改善）；
                                             让电机主动倒转，直接抵消拖拽，不受电压/地面影响。
                                             -70 是以前 PIVOT-C 验证过的值。
                                             调法：转过头/切内道 -> -50；转不够 -> -90。 */
+
+/* 由上面两个目标反算的弧线中心速度 / 差速。不要再手抄 115 / 185：
+   外轮 = 中心 + 差速，内轮 = 中心 − 差速。 */
+#define ARC_CENTER_SPEED        ((ARC_OUTER_SPEED + ARC_INNER_SPEED) * 0.5f)  /* 115 */
+#define ARC_TURN_SPEED          ((ARC_OUTER_SPEED - ARC_INNER_SPEED) * 0.5f)  /* 185 */
+
 #define ARC_LEAD_DEG            9.0f     /* 提前这么多度就断电，靠惯性走完。
                                             246°/s 断电后还会滑 5~8°，不提前就会转过头。 */
+
+/* ---- [ARC-TAIL 2026-11-27] 弧线末段速率收敛（移植 car-main3） ----
+   现状：ARC 段是"恒定差速 + 到 (90 − LEAD)° 断电靠惯性滑"，
+        本质是撞到 90° 再刹，落点方差大。
+   打开后：接近目标角度时把允许角速度压下来
+        remain = ARC_YAW_DEG − dir×yaw
+        ω_des  = min(turn×1.644, ARC_TAIL_K × remain)
+   只往下收、不往上加，所以刚进弯仍是满舵，末段自己"滑进去停住"。
+   K=40 时：剩余 4.6° 开始收敛（185×1.644/40 = 7.6°，实际从 7.6° 起）。
+
+   **注意**：收敛后断电点必须同时提前量降下来，否则会停在
+   (90−9)=81° 就断电、剩下的角度全靠惯性 —— 反而更差。
+   ARC_EXIT_LEAD_DEG 自动切换，不需要手动改 ARC_LEAD_DEG。
+
+   回滚：ARC_TAIL_ENABLE 改 0，断电判据回到 ARC_LEAD_DEG(9)，
+         ARC 段与改动前逐字节一致。 */
+#ifndef ARC_TAIL_ENABLE
+#define ARC_TAIL_ENABLE         1
+#endif
+#define ARC_TAIL_K             80.0f     /* °/s 每 °：越大收敛越早越柔。
+                                            40 时从剩余 10.3° 开始收（要 6 拍，比满速多 3 拍）；
+                                            80 时从 5.1° 开始收（只要 2 拍）——
+                                            顶满脉冲后断电 ω 更高，必须收得更早。 */
+#define ARC_TAIL_MIN_DEG        0.5f     /* remain 下限，避免 ω_des 直接归零 */
+#define ARC_TAIL_LEAD_DEG       2.0f     /* 收敛模式下的断电提前量 */
+
+/* 必须写成"使用点展开"的表达式：下面的 #if 会在定义处求值，
+   而 ARC_TAIL_ENABLE 可能被外部 -D 覆盖或后续改动，用三目最安全。 */
+#define ARC_EXIT_LEAD_DEG       ((ARC_TAIL_ENABLE != 0) ? ARC_TAIL_LEAD_DEG : ARC_LEAD_DEG)
+
+/* ---- [ARC-PUNCH 2026-11-27] 起转顶满脉冲 ----
+   思路：直角弯只需要"转过 90°"，不需要"匀速转 90°"。
+        前 N 拍把差速顶到电机能给的最大值，把 ω 从 411°/s 拉起来，
+        之后回落到正常弧线，让 TAIL 收尾。
+
+   时间账（400 档，L=18cm）：
+     现在  恒定差速 250 -> ω=411°/s -> 转 90° 用 22 拍
+     顶满  差速 500     -> ω 最高 ~820°/s（受电机上限，实际 600~700）
+                         -> 转 90° 约 14~16 拍
+
+   物理约束（**这一段决定了值能开多大**）：
+     原地旋转的向心加速度 a = ω² × R_自身，R_自身 ≈ 轮距/2 = 9 cm
+       ω=411°/s (7.2 rad/s) -> 4.6 m/s² = 0.47 g   ← 现在，无压力
+       ω=600°/s (10.5 rad/s) -> 9.9 m/s² = 1.01 g
+       ω=800°/s (14.0 rad/s) -> 17.6 m/s² = 1.80 g ← 这是 45° 弯都做不到的水平
+     所以 ω 越高，需要的抓地力按 ω² 暴涨。顶满只是"短暂"冲一下，
+     靠轮胎峰值摩擦顶住，不能长期维持 —— 所以必须限拍数。
+
+   风险：
+     1) 外轮目标 700 很可能超过电机空载转速 -> PID 打满占空比饱和。
+        这是**可接受的**：饱和只会让它跑自己最快，不会烧。
+        但记账的 turn 会比实际大，即"代码以为在转 500，实际只转了 350"。
+     2) 内轮 -300 反接，电流大。**跑 3 个弯摸驱动温度**，烫就减 ARC_PUNCH_TURN。
+     3) 断电时 ω 更高，惯性滑转会从 2° 变成 5~8°。
+        所以必须同时把 ARC_TAIL_K 提到 80（40 太保守，来不及收）。
+
+   回滚：ARC_PUNCH_ENABLE 改 0，ARC 段恢复"恒定 115 / 250"的原有行为。 */
+#ifndef ARC_PUNCH_ENABLE
+#define ARC_PUNCH_ENABLE        1
+#endif
+#define ARC_PUNCH_TICKS         8U       /* 前 8 拍（80 ms）顶满 */
+#define ARC_PUNCH_CENTER      200.0f     /* 顶满期间中心速度 */
+#define ARC_PUNCH_TURN        500.0f     /* 顶满期间差速 -> 外 700 / 内 -300 */
+
+/* ---- [ARC-DAMP 2026-11-27] 末段陀螺阻尼（朋友实测方法） ----
+   现象：直角弯抖动。
+
+   根因（已确认）：300v0.2 的 ARC 段**没有任何速率反馈** ——
+     `ARC_RATE_LOOP_ENABLE` 根本没定义，`#if ... == 1` 整块被编译掉。
+     ARC 是"开环恒定差速 + TAIL 压指令"：
+       - TAIL 只把**允许的角速度**往下压（改指令）
+       - 但车实际还在以 550~650°/s 惯性旋转（顶满脉冲之后）
+     指令压下去了、实际转速没压下去 -> 末段反复过冲 -> 抖动。
+
+   办法：离目标角 ≤ ARC_DAMP_DEG(60°) 时，按**实测角速度**做阻尼：
+       turn_r -= ARC_DAMP_K × dir × gyro_z
+   这就是巡线里 DAMP_K 的同一个东西，只是只作用于末段 60°。
+   提前开（比如 90°）会在起转阶段就把舵收掉，直角弯会变慢；
+   只在后 60° 开，既不损失起转速度，又能刹住。
+
+   符号：dir×gyro_z = 车在该弯方向上的实际角速度，减去它就等于反打。
+   限幅到 0：不允许把差速减成反向（否则内轮会正转、出现反打）。
+
+   回滚：ARC_DAMP_ENABLE 改 0。 */
+#ifndef ARC_DAMP_ENABLE
+#define ARC_DAMP_ENABLE         1
+#endif
+#define ARC_DAMP_DEG           60.0f     /* 剩余角度 ≤ 这个值才开阻尼 */
+#define ARC_DAMP_K              0.35f    /* 阻尼增益（直道 DAMP_K 是 0.40） */
+
+/* ---- [BEND-PUNCH 2026-11-27] 折角起转脉冲 ----
+   ARC 顶满脉冲验证成功后（12 个直角弯，驱动冰凉），把同一思路搬到 45° 折角。
+
+   折角的死结：
+     45° 需要 R ≤ 8.0 cm，而 turn ≤ speed_cmd 保证 R ≥ 8 cm —— 正好卡在下界。
+     更要命的是"CURVE_SLOW 定点"让 turn 只能到 308，R = 10.8 cm，差 26%。
+     而折角从"线开始偏"到"线出阵列"只有 3 拍，根本没有时间慢慢加速。
+
+   办法：折角一触发，直接给一个短时超额脉冲，越过 turn ≤ speed 的限制：
+     speed = 260, turn = 400  ->  外轮 660 / 内轮 -140
+     ω = 400×1.644 = 658°/s
+     车还带着 0.92 m/s 时：R = 0.92 / (658×π/180) = 8.0 cm  ← 正好够
+     抓地：v²/R = 10.6 m/s² = 1.08 g                          ← 400 档给得起
+
+   为什么不会像 REV_ALLOW 那样游龙（三条硬门限）：
+     1) **只在 near_d 的上升沿触发**，一个弯只打一次，不持续；
+     2) 要求 |Δerr| ≥ BEND_PUNCH_DE(0.8 路/拍) —— 真折角是 2 路/拍，
+        直道噪声只有 0.2~0.5，过不了这一关；
+     3) 只持续 BEND_PUNCH_TICKS(4) 拍，之后立刻回到正常巡线。
+   REV_ALLOW 那次是"near_d 一开就一直允许超额"，没有时间限制，
+   所以直道噪声也能触发 -> 速度环正反馈 -> 大游龙。
+
+   回滚：BEND_PUNCH_ENABLE 改 0，行为与改动前完全一致。 */
+#ifndef BEND_PUNCH_ENABLE
+#define BEND_PUNCH_ENABLE       1
+#endif
+#define BEND_PUNCH_TICKS        4U       /* 脉冲拍数：4 拍 = 40 ms */
+#define BEND_PUNCH_TURN       400.0f     /* 脉冲期间差速（外 660 / 内 -140） */
+#define BEND_PUNCH_SPEED      260.0f     /* 脉冲期间中心速度上限 */
+#define BEND_PUNCH_DE           0.8f     /* 触发门限：|Δerr| 路/拍 */
+
+/* ---- [ARC-ENTRY-BRAKE 2026-11-27] ARC 入口两轮同时制动（移植 car-main3） ----
+   机制（car-main3 2026-11-26）：入口把中心速度压到 ARC_ENTRY_SPEED(0)，
+   两轮目标从"外 300 / 内 −70"变成"外 +185 / 内 −185"：
+     - 外轮目标从 300 降到 185：入口那几拍不再往前推（受 Motor_Output 的
+       "输出不允许与目标反向"护栏限制，外轮实际是滑行，不是反向通电）；
+     - 内轮反接从 −70 加深到 −185：制动力更大。
+   这里用带符号中心速度（左右实测速度的平均，不是幅值平均）判交接：降到弧线
+   中心速度 ARC_CENTER_SPEED(115) 时交回正常弧线。若用幅值平均，正常弧线里
+   恒为 185（外 300/内 −70），115 永远到不了。done 锁存避免在阈值附近来回切。
+
+   参数来源：car-main3 的 ARC_ENTRY_BRAKE_ENABLE=1 / ARC_ENTRY_SPEED=0。
+   **注意**：car-main3 的 ARC_ENTRY_EXIT=260 是它 520 档的弧线中心速度
+   （外 590 / 内 −70）；300v0.2 的弧线中心是 115，所以按同一条
+   "EXIT = 弧线中心速度"规则换算成 115，不能照抄 260。
+
+   风险：入口几拍外轮滑行 + 内轮反接，电流/温升高于纯单轮；先跑 5 个弯摸温度。
+   回滚：ARC_ENTRY_BRAKE_ENABLE 改 0，ARC 段即恢复 115 / 185 的原行为。 */
+#ifndef ARC_ENTRY_BRAKE_ENABLE
+#define ARC_ENTRY_BRAKE_ENABLE   0      /* [NO-BRAKE 2026-11-27] 1 -> 0：带速直接转。
+                                          关掉后 ARC 段直接用弧线中心速度 115，
+                                          入口不再"两轮同时制动 20 拍"。
+                                          实测时间账（400 档）：
+                                            开 = 制动20拍 + 转22拍 + 交接5拍 ≈ 47 拍
+                                            关 = 转22拍 + 交接5拍          ≈ 27 拍（快 43%）
+                                          半径从 4.8 cm 变成 6.2 cm（仍 < 8 cm 下界）。
+                                          回滚：改回 1 即恢复入口制动。 */
+#endif
+#define ARC_ENTRY_SPEED          0.0f
+#define ARC_ENTRY_EXIT           ARC_CENTER_SPEED
+#define ARC_ENTRY_BRAKE_MAX_TICKS 20U    /* 200 ms 兜底：速度一直降不下来就交回 */
 
 /* [ARC2 2026-11-21] 弧线断电后的航向收尾。
    ARC_SETTLE_ENABLE = 0 就是回滚：断电后直接交回巡线（旧行为，一行开关）。 */
@@ -215,12 +412,12 @@
 #define ARC_TRIG_ERR            3.5f     /* [ARC 2026-11-18] 圆弧触发还要求误差已接近极限。
                                             只靠"宽线"会把缓弯、十字路口全当成直角弯
                                             （方向环太强：mask=4095 全亮也触发过）。 */
-#define KINEMA_TD               0.5f     /* [CENTER 2026-11-18] 0.3 -> 0.5：增益拿回 16 后
+#define KINEMA_TD               0.65f     /* [CENTER 2026-11-18] 0.3 -> 0.5：增益拿回 16 后
                                             需要更多阻尼，否则又会摆。 */
 #define DIR_DAMP                0.25f    /* [DAMP 2026-11-16] 陀螺阻尼：turn -= DIR_DAMP × gyro_z。
                                              车转 100°/s 时收回 25，抑制中心附近的来回摆。
                                              过大会"转不动"，建议 0.15~0.30 */
-#define TURN_SLEW               20.0f    /* [SPEED300 2026-11-21] 5 -> 20。
+#define TURN_SLEW               27.0f    /* [SPEED300 2026-11-21] 5 -> 20。
                                             5/拍时弯口只有 ~10 拍可用，turn 最多爬到 50，
                                             而 45° 弯在 300 下要 250（实测 err 3.5 只到 −25）。
                                             20/拍 -> 10 拍能到 200。直道需求只有 ±35，
@@ -469,7 +666,7 @@
 #define LINE_HOLD_TICKS         16U      /* 保持 16 拍（160 ms）。
                                             按 60° 弯算：turn 顶到 240 时 ω≈394°/s，
                                             转 60° 要 ~15 拍，所以 16 才够；8 拍时只能转 30°。 */
-#define LINE_HOLD_SPEED_K       0.8f     /* 保持期间速度 = 0.8 × BASE。
+#define LINE_HOLD_SPEED_K       0.6f     /* 保持期间速度 = 0.8 × BASE。
                                             太慢会影响可用舵量（turn ≤ speed）。 */
 #define LINE_HOLD_SLEW          20.0f    /* 保持期间**继续加舵**的斜率（每拍）。
                                             丢线那一刻 turn 往往只有 100~150（还在爬坡），
@@ -731,7 +928,7 @@
                                             "HOLD 16 拍 + 原地补转 45° 约 80 拍"，
                                             30 拍时车已经被 Car_Stop 掐断，
                                             RECOVER2 只跑了 13 拍就被停车（看起来"没补"）。 */
-#define ENC_DELTA_LIMIT         2000     /* [SPEED300 2026-11-21] 500 -> 2000。
+#define ENC_DELTA_LIMIT         2300     /* [SPEED300 2026-11-21] 500 -> 2000。
                                              BASE 300 时正常一拍增量就有 300，弯道峰值 450，
                                              500 只差一点就会误杀真数据（坏采样保护沿用旧值）。 */
 

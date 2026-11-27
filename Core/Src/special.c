@@ -117,6 +117,8 @@ void Corner_Reset(CornerState *c)
     c->settle_ticks = 0U;   /* [SETTLE 2026-11-15] */
     c->arc_brake_active = 0U;  /* [ARC-BRAKE 2026-11-23] */
     c->arc_brake_ticks  = 0U;
+    c->arc_entry_brake_done  = 0U;  /* [ARC-ENTRY-BRAKE 2026-11-27] */
+    c->arc_entry_brake_ticks = 0U;
 
     cw_pend      = 0U;      /* [CW4] 丢线确认状态也清 */
     cw_pend_wait = 0U;
@@ -212,6 +214,8 @@ static void Corner_Enter(CornerState *c, float dir)
     c->state = CORNER_ST_ARC;
     c->arc_brake_active = 1U;   /* [ARC-BRAKE] 入口里程刹车 */
     c->arc_brake_ticks  = 0U;
+    c->arc_entry_brake_done  = 0U;  /* [ARC-ENTRY-BRAKE] 本弯从"制动中"开始 */
+    c->arc_entry_brake_ticks = 0U;
 
     /* 入弯前清速度环积分，保证每次刹车起点一致 */
     pid_L.integral = 0.0f;
@@ -758,6 +762,7 @@ float Corner_Update(CornerState *c,
                     uint8_t gyro_ok,
                     float gyro_z,
                     float speed_meas,
+                    float speed_center,
                     uint8_t flow_fire,
                     float flow_dir,
                     float *speed_cmd)
@@ -1135,8 +1140,88 @@ float Corner_Update(CornerState *c,
            内轮不再靠摩擦"刹到 0"（地面拖拽比反向脉冲大，刹不住），
            而是让电机主动倒转抵消拖拽 -> 不再受电压/地面影响。
            300 / -70 时：Δv = 370 counts/10ms -> ω = 304°/s，90° 约 0.30 s，半径约 5 cm。 */
-        *speed_cmd = (ARC_OUTER_SPEED + ARC_INNER_SPEED) * 0.5f;
-        turn_r     = (ARC_OUTER_SPEED - ARC_INNER_SPEED) * 0.5f;
+
+        /* [ARC-ENTRY-BRAKE 2026-11-27] 入口两轮同时制动（机制同 car-main3）：
+           入口前几拍把中心速度压到 ARC_ENTRY_SPEED(0)，两轮目标变成
+           ±ARC_TURN_SPEED（400 档 外 +185 / 内 −185）：
+             - 外轮目标从 300 降到 185，入口不再往前推；受 Motor_Output 的
+               "输出不允许与目标反向"护栏限制，外轮实际是滑行，不是反向通电；
+             - 内轮反接从 −70 加深到 −185，制动力更大。
+           带符号中心速度降到 ARC_CENTER_SPEED(115) 后交回正常弧线，并锁存
+           done：避免在 115 附近来回切，也避免用幅值平均时 115 永远到不了
+           （正常弧线的幅值平均是 185）。速度一直降不下来由 MAX_TICKS 兜底。 */
+#if (ARC_ENTRY_BRAKE_ENABLE != 0)
+        if (c->arc_entry_brake_done == 0U)
+        {
+            ++c->arc_entry_brake_ticks;
+
+            if ((speed_center <= ARC_ENTRY_EXIT) ||
+                (c->arc_entry_brake_ticks >= ARC_ENTRY_BRAKE_MAX_TICKS))
+            {
+                c->arc_entry_brake_done = 1U;
+
+                /* [诊断] 16 = ARC 入口双轮制动结束：
+                   cnt = 交接时的中心速度（counts/10ms），err10 = 制动拍数×10。
+                   预期 cnt 接近 115、拍数 3~15；拍数 20 = 速度没降下来，兜底。 */
+                Corner_Log(16U, c->dir, mask, c->cw_mask,
+                           (int)speed_center, (float)c->arc_entry_brake_ticks);
+            }
+        }
+
+        *speed_cmd = (c->arc_entry_brake_done == 0U)
+                   ? ARC_ENTRY_SPEED
+                   : ARC_CENTER_SPEED;
+#else
+        (void)speed_center;     /* 关掉入口制动时这个入参不用 */
+        *speed_cmd = ARC_CENTER_SPEED;
+#endif
+        turn_r     = ARC_TURN_SPEED;
+
+#if (ARC_PUNCH_ENABLE != 0)
+        /* [ARC-PUNCH 2026-11-27] 起转顶满：前 N 拍用最大差速把 ω 拉起来。
+           直角弯只需要"转过 90°"，不需要"匀速转 90°"。
+           顶满期间外轮 700 / 内轮 -300（差速 500），ω 理论上到 820°/s
+           （实际受电机上限，600~700）。之后回落到 115 / 250，
+           由下面的 TAIL 负责收尾。
+           注意：外轮 700 大概会超过电机空载转速 -> PID 饱和打满占空比。
+           这是可接受的（饱和不会烧），但意味着记账的 turn 比真实的大。 */
+        if (c->arc_ticks <= ARC_PUNCH_TICKS)
+        {
+            *speed_cmd = ARC_PUNCH_CENTER;
+            turn_r     = ARC_PUNCH_TURN;
+        }
+#endif
+
+#if (ARC_TAIL_ENABLE != 0)
+        /* [ARC-TAIL 2026-11-27] 末段速率收敛：让车"滑进去停住"而不是
+           "撞到 90° 再刹"。remain = 还差多少度，ω_des 随 remain 线性下降。
+           只往下收、不往上加 —— 刚进弯仍是满舵 185，和改动前一致。 */
+        {
+            float remain = ARC_YAW_DEG - (float)c->dir * c->yaw;
+            float w_nom;
+
+            if (remain < ARC_TAIL_MIN_DEG) remain = ARC_TAIL_MIN_DEG;
+
+            w_nom = ARC_TAIL_K * remain;                 /* 允许的角速度 °/s */
+            if (w_nom < (turn_r * OMEGA_PER_TURN))       /* 只收不放 */
+                turn_r = w_nom / OMEGA_PER_TURN;
+        }
+#endif
+
+#if (ARC_DAMP_ENABLE != 0)
+        /* [ARC-DAMP 2026-11-27] 末段陀螺阻尼：只在"离目标角 ≤ ARC_DAMP_DEG"时开。
+           TAIL 只压"允许角速度"（指令），压不住"实际角速度"；
+           顶满脉冲之后车还在以 550~650°/s 惯性旋转，指令压下去了、
+           实际转速没压下去 -> 末段反复过冲 -> 直角弯抖动。
+           这里减 K×实测角速度，把实际转速也拉下来。
+           限幅到 0：不允许把差速减成反向（否则内轮正转，出现反打）。 */
+        if ((gyro_ok != 0U) &&
+            ((ARC_YAW_DEG - (float)c->dir * c->yaw) <= ARC_DAMP_DEG))
+        {
+            turn_r -= ARC_DAMP_K * (float)c->dir * gyro_z;
+            if (turn_r < 0.0f) turn_r = 0.0f;
+        }
+#endif
 
 #if (ARC_RATE_LOOP_ENABLE == 1)
         /* [ARC-RATE 2026-11-25] 陀螺角速度内环：只改差速，不改中心速度。
@@ -1168,7 +1253,7 @@ float Corner_Update(CornerState *c,
            [ARC-EXIT 2026-11-21] 角度到位分两条：
              - 陀螺在 且 开了收尾 -> 先进 ARC_SETTLE 闭环补角；
              - 陀螺掉了 / 收尾关掉 -> 走统一出口（cnt==0 去补转，cnt>0 才回 LINE）。 */
-        if ((gyro_ok && ((c->dir * c->yaw) >= (ARC_YAW_DEG - ARC_LEAD_DEG))) ||
+        if ((gyro_ok && ((c->dir * c->yaw) >= (ARC_YAW_DEG - ARC_EXIT_LEAD_DEG))) ||
             ((gyro_ok == 0U) && (c->arc_ticks >= 40U)))
         {
 #if (ARC_SETTLE_ENABLE == 1)

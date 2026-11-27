@@ -68,6 +68,9 @@ typedef struct {
     uint8_t  arc_line_ticks; /* [ARC 2026-11-18] 出弯后连续看到线的拍数 */
     uint8_t  arc_brake_active; /* [ARC-BRAKE 2026-11-23] 1 = 里程内环刹车中 */
     uint16_t arc_brake_ticks;  /* [ARC-BRAKE] 刹车已执行拍数 */
+    uint8_t  arc_entry_brake_done;  /* [ARC-ENTRY-BRAKE 2026-11-27] 1 = 本弯入口
+                                       双轮制动已结束，本弯内不再重新进入 */
+    uint16_t arc_entry_brake_ticks; /* [ARC-ENTRY-BRAKE] 已执行拍数（20 拍兜底） */
 } CornerState;
 
 /* [CWDBG 2026-11-22] 直角弯判据的一次性事件快照（中断入队，主循环打印） */
@@ -167,7 +170,8 @@ uint8_t Corner_PopEvent(uint8_t *why, int8_t *dir, uint16_t *mask, uint16_t *cw_
 
 /* 返回最终 turn；speed_cmd 由函数写入。
    pid_turn 是方向环 PID + 二次项、限幅后的值。
-   speed_meas 是编码器实测速度（左右平均），刹车段用它判停。 */
+   speed_meas 是编码器实测速度（左右幅值平均），旧刹车段用它判停。
+   speed_center 是带符号的中心速度 ((vL+vR)/2)，ARC 入口双轮制动用它判交接。 */
 float Corner_Update(CornerState *c,
                     float pid_turn,
                     float error,
@@ -176,6 +180,7 @@ float Corner_Update(CornerState *c,
                     uint8_t gyro_ok,
                     float gyro_z,
                     float speed_meas,
+                    float speed_center, /* [ARC-ENTRY-BRAKE] 带符号中心速度 */
                     uint8_t flow_fire,  /* [FLOW-OR] 1 = FLOW 请求触发 ARC */
                     float flow_dir,     /* [FLOW-OR] +1 左 / -1 右 */
                     float *speed_cmd);

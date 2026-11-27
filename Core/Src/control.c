@@ -40,6 +40,19 @@ static float   turn_prev;          /* [SLEW 2026-11-16] 上一拍的转向命令
 static float   err_f;              /* [KINEMA 2026-11-18] 低通后的误差（单位：路） */
 static float   err_prev;           /* [KINEMA 2026-11-18] 上一拍滤波后的误差（算微分） */
 static uint8_t near_d;             /* [SPEED300 2026-11-21] 1 = 当前用短前视（进弯中） */
+
+#if (BEND_PUNCH_ENABLE != 0)
+static uint8_t near_d_prev;        /* [BEND-PUNCH 2026-11-27] 上一拍 near_d，用于上升沿 */
+static uint8_t bend_punch_ticks;   /* [BEND-PUNCH] 本次脉冲剩余拍数 */
+static float   err_de_now;         /* [BEND-PUNCH] 本拍误差变化率（路/拍） */
+static int8_t  bend_punch_dir;     /* [BEND-PUNCH] 触发瞬间锁存的脉冲方向 */
+#endif
+
+#if (HEX_PUNCH_ENABLE != 0)
+static uint8_t hex_punch_ticks;    /* [HEX-PUNCH 2026-11-27] 顶点脉冲剩余拍数 */
+static uint8_t hex_punch_armed;    /* [HEX-PUNCH] 1 = 已越过门限，等回落后才能再触发 */
+static int8_t  hex_punch_dir;      /* [HEX-PUNCH] 触发瞬间锁存的脉冲方向 */
+#endif
 static uint8_t line_hold_ticks;    /* [HOLD 2026-11-21] 丢线后已保持转向的拍数 */
 static float   line_hold_turn;     /* [HOLD] 丢线前一拍的舵量 */
 static uint8_t rec2_done;          /* [RECOVER2] 1 = 同向补转已经做完（或本次丢线不允许补转） */
@@ -75,6 +88,8 @@ static int16_t last_valid_dL = 0, last_valid_dR = 0;
 /* ---- 调试快照：中断写、主循环读，只做显示用 ---- */
 static volatile int16_t dbg_dL = 0, dbg_dR = 0;
 static volatile float   dbg_speed_L = 0.0f, dbg_speed_R = 0.0f;
+static volatile float   dbg_error = 0.0f;   /* [DIAG400 2026-11-27] 本拍光电误差（路） */
+static volatile float   dbg_turn  = 0.0f;   /* [DIAG400] 本拍方向环输出的转向量 */
 
 /* [LOSTDBG 2026-11-22] 丢线沿检测：记录"丢线前一拍"的 error/mask，
    主循环取一次打印 LOST,<err×10>,<mask>,<spdL>,<spdR>,<corner>。
@@ -592,6 +607,7 @@ static uint8_t Control_Direction(void)
 
     /* 1) 12 路 -> 偏差 */
     Sensor_Scan(&line);
+    dbg_error = line.error;     /* [DIAG400 2026-11-27] 与 turn/gyro 同一拍输出 */
 
 #if (FINISH_ENABLE == 1)
     /* [FINISH3 2026-11-27] 前 FINISH_ARM_MM 不做终线识别；
@@ -812,6 +828,9 @@ static uint8_t Control_Direction(void)
                 float de = err_f - err_prev;
                 err_prev = err_f;
                 err_d    = err_f + KINEMA_TD * de;
+#if (BEND_PUNCH_ENABLE != 0)
+                err_de_now = de;        /* [BEND-PUNCH 2026-11-27] 块外判据要用 */
+#endif
             }
 
             v = car.speed_cmd;                  /* 上一拍的速度目标，够用 */
@@ -833,6 +852,24 @@ static uint8_t Control_Direction(void)
                 near_d = 1U;
             else if ((err_f < CORNER_NEAR_ERR * 0.6f) && (err_f > -CORNER_NEAR_ERR * 0.6f))
                 near_d = 0U;
+
+#if (BEND_PUNCH_ENABLE != 0)
+            /* [BEND-PUNCH 2026-11-27] 折角起转脉冲的触发判据。
+               三条门限缺一不可（见 car_config.h 的说明）：
+                 1) near_d 上升沿 —— 一个弯只打一次
+                 2) |de| ≥ BEND_PUNCH_DE —— 真折角是 2 路/拍，直道噪声 0.2~0.5
+                 3) 不在六边形区间 —— 那里有自己的 TURN_MAX_HEX 逻辑
+               为什么必须看 de：REV_ALLOW 那次就是"near_d 一开就允许超额"，
+               没有这个门限，直道噪声也能触发 -> 大游龙。 */
+            if ((near_d != 0U) && (near_d_prev == 0U) && (hz == 0U) &&
+                ((err_de_now > BEND_PUNCH_DE) || (err_de_now < -BEND_PUNCH_DE)))
+            {
+                bend_punch_ticks = BEND_PUNCH_TICKS;
+                /* 方向在触发这一拍就锁死。符号约定同方向环：error>0 线在右 -> turn<0 */
+                bend_punch_dir = (err_f >= 0.0f) ? -1 : +1;
+            }
+            near_d_prev = near_d;
+#endif
 
             if (near_d != 0U)
                 d = (hz != 0U) ? PURSUIT_L_CM_HEX_NEAR : PURSUIT_L_CM_NEAR;
@@ -900,6 +937,33 @@ static uint8_t Control_Direction(void)
                 if (bt > tmax) tmax = bt;
             }
 
+#if (HEX_PUNCH_ENABLE != 0)
+            /* [HEX-PUNCH 2026-11-27] 顶点起转脉冲的触发。
+               六边形是一整片区间，每个顶点都要单独打一次脉冲，
+               所以用"|error| 越过 HEX_PUNCH_ERR"的上升沿 +
+               armed 标志防止连续重触发（必须等误差回落才重新武装）。
+               注意用 line.error（原始）而不是 err_f：滤波会滞后 1~2 拍，
+               而顶点只有 ~10 拍可用。 */
+            {
+                float ae = (line.error >= 0.0f) ? line.error : -line.error;
+
+                if (ae < (HEX_PUNCH_ERR * 0.6f))
+                {
+                    hex_punch_armed = 0U;          /* 回落 -> 重新武装 */
+                    hex_punch_ticks = 0U;          /* 同时结束本顶点脉冲 */
+                }
+                else if ((hex_punch_armed == 0U) && (ae >= HEX_PUNCH_ERR))
+                {
+                    hex_punch_armed = 1U;
+                    hex_punch_ticks = HEX_PUNCH_TICKS;
+                    /* 方向锁存：符号约定同方向环（error>0 线在右 -> turn<0）。
+                       必须在触发瞬间锁死——顶点过零时 line.error 会翻符号，
+                       如果每拍重算方向，车会被左右来回抽（实测"剧烈拉扯"）。 */
+                    hex_punch_dir  = (line.error >= 0.0f) ? -1 : +1;
+                }
+            }
+#endif
+
             if (pid_turn >  tmax) pid_turn =  tmax;
             if (pid_turn < -tmax) pid_turn = -tmax;
 
@@ -912,6 +976,12 @@ static uint8_t Control_Direction(void)
     /* 3) 丢线保护：过弯锁存期间/斜穿期间不因线暂时消失而停 */
     if (car.run_flag != 0U)
     {
+#if (BEND_PUNCH_ENABLE != 0)
+        if (line.cnt == 0U) bend_punch_ticks = 0U;   /* [BEND-PUNCH] 丢线即清，防止残留 */
+#endif
+#if (HEX_PUNCH_ENABLE != 0)
+        if (line.cnt == 0U) hex_punch_ticks = 0U;    /* [HEX-PUNCH] 同上 */
+#endif
         if (line.cnt == 0U && !Corner_IsActive(&corner) && (blind_phase == 0U))//丢线且不处于过弯态
         {
             if (++car.lost_cnt >= LOST_STOP_TICKS)
@@ -1002,11 +1072,16 @@ static uint8_t Control_Direction(void)
            每拍都判“不动”，0.4 s 就把 pivot 掐断（现场“只转 60° 就停”就是这么来的）。 */
         float sp_l = (dbg_speed_L >= 0.0f) ? dbg_speed_L : -dbg_speed_L;
         float sp_r = (dbg_speed_R >= 0.0f) ? dbg_speed_R : -dbg_speed_R;
+        /* [ARC-ENTRY-BRAKE 2026-11-27] 带符号中心速度：ARC 入口双轮制动用它判
+           "降到弧线中心速度没有"。幅值平均在正常弧线里恒为 185（外 300/内 −70），
+           永远到不了 115，所以这里必须用带符号的平均，不能复用 sp_l/sp_r。 */
+        float sp_center = (dbg_speed_L + dbg_speed_R) * 0.5f;
 
         turn = Corner_Update(&corner, pid_turn, line.error, line.cnt,
                              line.mask,                          /* [CW 2026-11-15] 直角弯检测用 */
                              Gyro_IsOk(), Gyro_GetZ(),
                              (sp_l + sp_r) * 0.5f,               /* 幅值平均：pivot 时 ≈ 45，真堵转时 ≈ 0 */
+                             sp_center,                          /* [ARC-ENTRY-BRAKE] 带符号中心速度 */
                              flow_fire, flow_dir,                /* [FLOW-OR] 新策略触发请求 */
                              &speed_local);
     }
@@ -1353,7 +1428,42 @@ static uint8_t Control_Direction(void)
         }
 
         pid_L.target = car.speed_cmd - turn;
+
+#if (BEND_PUNCH_ENABLE != 0)
+        /* [BEND-PUNCH 2026-11-27] 折角起转脉冲：短时越过 turn ≤ speed 的限制。
+           放在 clamp 之后，所以这里可以直接把 turn 抬到 BEND_PUNCH_TURN。
+           方向用触发瞬间锁存的 bend_punch_dir —— 不能每拍按 turn 的符号重算，
+           否则过零时会翻转，表现为"打舵打不进去 + 剧烈拉扯"。 */
+        if (bend_punch_ticks > 0U)
+        {
+            --bend_punch_ticks;
+
+            turn = (float)bend_punch_dir * BEND_PUNCH_TURN;
+            if (car.speed_cmd > BEND_PUNCH_SPEED)
+                car.speed_cmd = BEND_PUNCH_SPEED;
+
+            pid_L.target = car.speed_cmd - turn;
+        }
+#endif
+
         pid_R.target = car.speed_cmd + turn;
+
+#if (HEX_PUNCH_ENABLE != 0)
+        /* [HEX-PUNCH 2026-11-27] 六边形顶点脉冲：短时越过 turn ≤ speed 的限制。
+           方向同样用触发瞬间锁存的 hex_punch_dir。 */
+        if (hex_punch_ticks > 0U)
+        {
+            --hex_punch_ticks;
+
+            turn = (float)hex_punch_dir * HEX_PUNCH_TURN;
+            if (car.speed_cmd > HEX_PUNCH_SPEED)
+                car.speed_cmd = HEX_PUNCH_SPEED;
+
+            pid_L.target = car.speed_cmd - turn;
+            pid_R.target = car.speed_cmd + turn;
+        }
+#endif
+        dbg_turn     = turn;        /* [DIAG400 2026-11-27] 最终生效的转向（含 HOLD/ARC） */
 
         /* [SAFE 2026-11-14] 目标护栏：任何软件错误都不允许把目标推到几百，
            否则前馈会把占空比打满（现场出现过的“猛冲 + 呼啸”）。 */
@@ -1766,6 +1876,9 @@ void Control_GetDebug(ControlDebug *d)
     d->target_L  = pid_L.target;
     d->target_R  = pid_R.target;
     d->gyro_z    = Gyro_GetZ();
+    d->error     = dbg_error;
+    d->turn      = dbg_turn;
+    d->near_d    = near_d;
     d->run       = car.run_flag;
 }
 

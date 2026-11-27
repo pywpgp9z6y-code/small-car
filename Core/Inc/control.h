@@ -36,6 +36,9 @@ typedef struct {
     int16_t  dL, dR;             /* 10 ms 编码器增量 */
     float    target_L, target_R;
     float    gyro_z;             /* 滤波后的角速度，°/s */
+    float    error;              /* [DIAG400 2026-11-27] 本拍光电误差（路） */
+    float    turn;               /* [DIAG400] 本拍方向环输出（counts，未含 HOLD） */
+    uint8_t  near_d;             /* [DIAG400] 1 = 当前处于折角短前视模式 */
     uint8_t  run;                /* 1 = 正在跑 */
 } ControlDebug;
 
