@@ -121,7 +121,14 @@ static uint8_t  fin_active;     /* 1 = 已认出终线，正在走最后 30 cm *
 
 static uint8_t  post_state;     /* POST_IDLE = 没在跑 */
 static uint16_t post_ticks;     /* 当前状态计时（10 ms/拍） */
-static float    post_yaw0;      /* 自旋起始航向 */
+/* [POST-SPIN-FIX 2026-11-27] 自旋角度用**本状态自己累加**，与串口 '2' 的
+   Spin_Update 同一套做法（car.spin.yaw += Gyro_GetZ() * 0.01f，100 Hz）。
+   原来用 "Gyro_GetYaw() - post_yaw0"（全局航向做差）：POST_WAIT 的 1.5 s 里
+   车体只要被碰动/滑移，全局航向就跟着变，进入 POST_SPIN 第一拍 yaw_abs
+   就已经 >= 177，自旋段被瞬间跳过、直接进 POST_FOLLOW
+   （现场表现就是"按 p 不转 180°、直接开始巡线"）。
+   独立累加器从 0 起算，WAIT 期间车怎么动都不影响，可靠性同 '2'。 */
+static float    post_spin_yaw;  /* 本次自旋已转角，°（本状态内累加） */
 static float    post_odom0;     /* 巡线起始里程 */
 static uint8_t  post_lit;       /* 全亮连续拍数 */
 static uint8_t  post_hit;       /* 1 = 停在横条上（全亮） */
@@ -410,7 +417,7 @@ static void Post_Start(void)
     post_ticks  = 0U;
     post_lit    = 0U;
     post_hit    = 0U;
-    post_yaw0   = Gyro_GetYaw();
+    post_spin_yaw = 0.0f;      /* [POST-SPIN-FIX] 进入 SPIN 时还会再清一次 */
     post_odom0  = g_odom_mm;
     fin_active  = 0U;          /* 关掉终线逻辑，别在收尾阶段重复触发 */
     car.speed_cmd = 0.0f;
@@ -424,8 +431,7 @@ static void Post_Start(void)
 static uint8_t Post_Update(void)
 {
     LineSample line;
-    float      yaw;
-    float      yaw_abs;
+    float      yaw_abs;       /* [POST-SPIN-FIX] 角度来自 static post_spin_yaw */
     float      err;
     float      cmd;
     float      turn;
@@ -443,7 +449,7 @@ static uint8_t Post_Update(void)
         {
             post_state = POST_SPIN;
             post_ticks = 0U;
-            post_yaw0  = Gyro_GetYaw();
+            post_spin_yaw = 0.0f;   /* [POST-SPIN-FIX] 从 0 起算，不看全局航向 */
             Motor_SetSpeedGains(PIVOT_KP, PIVOT_KI);
         }
         return 1U;
@@ -455,11 +461,16 @@ static uint8_t Post_Update(void)
             return 1U;
         }
 
-        yaw     = Gyro_GetYaw() - post_yaw0;
-        yaw_abs = (yaw >= 0.0f) ? yaw : -yaw;
+        /* [POST-SPIN-FIX 2026-11-27] 与 Spin_Update 一致：按 10 ms 自己累加角速度，
+           不再用全局航向做差（那会把 WAIT 期间的被动转动也算进来）。 */
+        post_spin_yaw += Gyro_GetZ() * 0.01f;
+        yaw_abs = (post_spin_yaw >= 0.0f) ? post_spin_yaw : -post_spin_yaw;
         ++post_ticks;
 
-        if ((yaw_abs >= (POST_SPIN_DEG - POST_SPIN_TOL)) ||
+        /* [POST-SPIN-FIX] 前 POST_SPIN_KICK_TICKS 拍必须真的打过 kick，
+           不允许首拍就退出（双保险：即使累加器读到异常大值也不会跳）。 */
+        if (((post_ticks > POST_SPIN_KICK_TICKS) &&
+             (yaw_abs >= (POST_SPIN_DEG - POST_SPIN_TOL))) ||
             (post_ticks >= POST_SPIN_TIMEOUT))
         {
             pid_L.target = 0.0f;
@@ -516,7 +527,12 @@ static uint8_t Post_Update(void)
             return 1U;
         }
 
-        turn = POST_TURN_KP * line.error;
+        /* [POST-SIGN-FIX 2026-11-27] 原来写的是 turn = +POST_TURN_KP * error，
+           与 sensor.h 的约定（error>0 线在右、应 turn<0 右转）相反，
+           方向环变成正反馈：越偏越往外拐，所以"抓不到线"。
+           输出公式 pid_L = speed - turn / pid_R = speed + turn 与主巡线一致，
+           所以这里必须带负号。 */
+        turn = -POST_TURN_KP * line.error;
         if (turn >  POST_TURN_MAX) turn =  POST_TURN_MAX;
         if (turn < -POST_TURN_MAX) turn = -POST_TURN_MAX;
 

@@ -169,12 +169,16 @@
 #define ARC_BRAKE_CCR_MAX       1500.0f  /* 里程环最大反接 CCR，不直接打满 PWM */
 #define ARC_BRAKE_PID_MAX_TICKS 20U      /* 200 ms 兜底，避免一直卡在刹车态 */
 
-/* ---- 断线区斜穿（[BLIND 2026-11-18]） ----
-   不是直角弯/六边形的场合丢线时，按固定角度斜穿过去找线：
-   tan = 15/65 -> 13.0°，路程 = √(15²+65²) = 66.7 cm。 */
-#define BLIND_ANGLE_DEG         22.88f   /* [BLIND 2026-11-22] 横向 300 mm / 纵向 650 mm ->
-                                            atan(300/650) = 24.775° */
-#define BLIND_DIST_CM           71.6f    /* [BLIND 2026-11-22] 斜穿路程 sqrt(650²+300²) = 715.9 mm */
+/* ---- 断线区斜穿（[BLIND 2026-11-18]，[2026-11-27] 按实际断线区尺寸重算） ----
+   不是直角弯/六边形的场合丢线时，按固定角度斜穿过去找线。
+   当前断线区：横向 250 mm × 纵向 650 mm
+     -> 转角 = atan(250/650) = 21.04°
+     -> 路程 = √(250² + 650²) = 696.4 mm = 69.64 cm
+   注意：这两个值必须**一起**重算，只改一个会斜着穿出赛道。 */
+#define BLIND_ANGLE_DEG         21.04f   /* [BLIND 2026-11-27] atan(250/650) = 21.04°
+                                            （上一版 22.88° 与注释里的 300/650 对不上，这里统一） */
+#define BLIND_DIST_CM           69.64f   /* [BLIND 2026-11-27] √(250²+650²) = 696.4 mm = 69.64 cm
+                                            （上一版 71.6 cm 对应的是 300/650） */
 #define BLIND_DIST_COUNTS       ((uint32_t)(BLIND_DIST_CM * COUNTS_PER_CM))
 #define BLIND_START_TICKS       5U       /* 丢线这么多拍后开始斜穿 */
 #define BLIND_SPEED             500.0f   /* [BLIND 2026-11-22] 60 -> 500：断线区 650 mm 快速穿过 */
@@ -411,7 +415,11 @@
                                            经常根本不形成（实测 20 cm 内一次都没有）；
                                            而 V1 的判据很硬，两次 V 间距手推实测 8.3 cm，
                                            所以"走 9 cm"和"等第二个 V"在几何上等价。 */
-#define HEX4_ARM_DIST_CM        9.0f     /* [HEX4] NEED_V2=0 时，武装后走这么远就进 */
+#define HEX4_ARM_DIST_CM        10.0f    /* [HEX4] NEED_V2=0 时，武装后走这么远就进。
+                                            [2026-11-27] 9.0 -> 10.0：出入口多留 1 cm 余量。
+                                            上限 HEX4_V2_MAX_CM = 20 cm 不变，仍有 10 cm 富余；
+                                            COUNTS 宏自动跟着变（10 × 435.7 ≈ 4357）。
+                                            太大会冲过顶点、太小会没转到位，一次只动 0.5~1 cm。 */
 #define HEX4_ARM_DIST_COUNTS    ((uint32_t)(HEX4_ARM_DIST_CM * COUNTS_PER_CM))
 
 /* [HEX4-ENTRYONLY 2026-11-23] 六边形逻辑只保留入口 30° 打舵：
@@ -491,7 +499,7 @@
 #define HEX4_BIG_ERR            2.0f     /* |error| > 这个值才算"大误差方向" */
 #define HEX4_STRAIGHT_TICKS     6U       /* 第一次 V 之后回正的拍数 */
 #define HEX4_STRAIGHT_K         0.6f     /* 回正舵量 = -K × V1 那一拍方向环的舵 */
-#define HEX4_TURN_DEG           30.0f    /* 进/出各打 30° */
+#define HEX4_TURN_DEG           27.0f    /* 进/出各打 30° */
 #define HEX4_TURN_TOL           4.0f     /* 角度容差 */
 #define HEX4_TURN_RATE          45.0f    /* 打舵用的差速（原地转） */
 #define HEX4_TURN_MAX_CM        12.0f    /* 打舵兜底：走这么多 cm 没转够就放弃 */
@@ -688,6 +696,22 @@
                                             两个独立速度环互相抢；Kp=8 时 CCR 在 376~508 拉锯（5~10 Hz 抖动） */
 #define PIVOT_KI                0.02f    /* [JUDDER 2026-11-15] 0.05 -> 0.02，积分放慢 */
 
+/* ---- [HEX-GAIN 2026-11-27] 六边形打舵专用的速度环增益 ----
+   背景：TURN_IN / TURN_OUT / TURN_BACK 这三段都是"两轮反向原地转"，
+   但代码里从来没切过增益，一直沿用直道的 SPEED_KP_DEFAULT(2.5)/SPEED_KI_DEFAULT(0.01)；
+   而直角弯 pivot 会切到 PIVOT_KP(3.0)/PIVOT_KI(0.02)。
+   两者物理工况一样、增益却不同，手感自然不一致 —— 这就是"六边形打舵和
+   直角弯打舵不像同一辆车"的来源之一。
+   这里给六边形单独一组，默认跟随直角弯 pivot（先验证"切增益"这个方向对不对），
+   之后可以只动这三个宏、完全不牵连直角弯：
+     · 打舵发抖 / 一顿一顿  -> HEX4_PIVOT_KP 降到 2.0，甚至 1.5
+     · 转动偏软、到不了 26° -> 往上加 0.5
+     · "先憋住再一冲"       -> HEX4_PIVOT_KI 减半
+   回滚：HEX4_USE_PIVOT_GAINS 改 0，行为与改动前完全一致（始终用直道增益）。 */
+#define HEX4_USE_PIVOT_GAINS    1
+#define HEX4_PIVOT_KP           PIVOT_KP
+#define HEX4_PIVOT_KI           PIVOT_KI
+
 /* ---- 起步 kick ---- */
 #define KICK_L                  390.0f
 #define KICK_R                  428.0f
@@ -792,7 +816,10 @@
 #define POST_SPEED               100.0f   /* 巡线速度（BASE 的 1/3） */
 #define POST_TURN_KP             45.0f    /* 每 1 路偏差给多少差速 */
 #define POST_TURN_MAX            80.0f
-#define POST_LIT_CNT             12U      /* 12/12 全亮 */
+#define POST_LIT_CNT             11U      /* [POST-LIT-FIX 2026-11-27] 12 -> 11：与 FINISH_LIT_CNT 对齐。
+                                             原来要求 12/12 全亮，比终线识别的 11 更严；
+                                             而边缘通道（ch0/ch11）斜压横条时经常漏读，
+                                             导致收尾段永远等不到全亮、跑满 1.5 m 后超时停车。 */
 #define POST_LIT_TICKS           1U
 #define POST_STOP_TICKS          20U      /* 停车后再保持 0 目标 200 ms */
 #define POST_FOLLOW_MAX_TICKS    800U     /* 8 s 找不到横条就停 */

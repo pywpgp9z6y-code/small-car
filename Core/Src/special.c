@@ -1837,6 +1837,34 @@ static uint8_t hx_flow_veto_latch; /* [HEX4-FLOW-VETO] 剩余锁存拍数 */
 static int8_t  hx_flow_veto_dir;   /* [HEX4-FLOW-VETO] 锁存的 FLOW 方向 */
 #endif
 
+/* ---- [HEX-GAIN 2026-11-27] 六边形打舵阶段的速度环增益切换 ----
+   0 = 当前用直道增益，1 = 已切到 pivot 增益。
+   用"变化检测"是必须的：Motor_SetSpeedGains() 内部会把速度环积分清零
+   （motor.c:24-25），如果每拍都调用，积分等于被废掉，稳态会出现
+   "永远差一点、一直补不上"的慢速抖动。所以只允许在**状态切换那一刻**调一次。 */
+#if (HEX4_USE_PIVOT_GAINS == 1)
+static uint8_t  hx_gain_pivot;
+#endif
+
+static void Hex_SetPivotGains(uint8_t on)
+{
+#if (HEX4_USE_PIVOT_GAINS == 1)
+    on = (uint8_t)((on != 0U) ? 1U : 0U);
+
+    if (on == hx_gain_pivot)
+        return;                         /* 没变化：不动积分 */
+
+    hx_gain_pivot = on;
+
+    if (on != 0U)
+        Motor_SetSpeedGains(HEX4_PIVOT_KP, HEX4_PIVOT_KI);
+    else
+        Motor_SetSpeedGains(SPEED_KP_DEFAULT, SPEED_KI_DEFAULT);
+#else
+    (void)on;                           /* HEX4_USE_PIVOT_GAINS=0：保持改动前行为 */
+#endif
+}
+
 /* ---- [HEX4 2026-11-21] 事件环形缓冲：主循环按序打印，不再"只打最新一条" ----
    原来 main.c 用"快照 + 序号"打印，两次事件之间主循环没跑到就会丢前面的。
    现在中断里入队，主循环取空为止；按 'c' 转储 0.22 s 也不会吞事件。 */
@@ -1977,6 +2005,12 @@ void Hex4_Reset(void)
     hx_straight   = 0U;
     hx_turn_at_v1 = 0.0f;
     hx_seq_last   = 0U;
+#if (HEX4_USE_PIVOT_GAINS == 1)
+    /* [HEX-GAIN 2026-11-27] 复位/停车：增益回直道档。
+       否则"打舵打到一半 Car_Stop"会把 pivot 增益残留到下一次发车。 */
+    hx_gain_pivot = 0U;
+    Motor_SetSpeedGains(SPEED_KP_DEFAULT, SPEED_KI_DEFAULT);
+#endif
 #if (HEX4_ENTRY_ONLY == 1)
     hx_lockout_dist = 0U;
 #endif
@@ -2763,6 +2797,16 @@ HexOutput Hex_Update4(HexState *h,
         if (--hxlog_after == 0U)
             hxlog_pause = 1U;       /* 冻结，主循环按 'h' 取出的就是这一段 */
     }
+
+    /* [HEX-GAIN 2026-11-27] 打舵阶段（TURN_IN=2 / TURN_OUT=4 / TURN_BACK=5）
+       切到六边形自己的 pivot 增益，其余阶段回直道增益。
+       放在状态机末尾**统一同步**，而不是每个 case 里各写一遍：
+       状态跳转点有十几处（含超时/否决/异常路径），逐处加容易漏；
+       这里只按"当前状态"推导一次，Hex_SetPivotGains 内部再做变化检测，
+       不会每拍清零速度环积分。 */
+    Hex_SetPivotGains((uint8_t)(((hx_state == 2U) ||
+                                 (hx_state == 4U) ||
+                                 (hx_state == 5U)) ? 1U : 0U));
 
     return out;
 }
