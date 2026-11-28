@@ -533,8 +533,12 @@ static void Corner_Watch(CornerState *c, uint16_t mask, int cnt, float error,
     /* 逐拍记录（按 'c' 打印），用于实测窗口/丢线拍数 */
     {
         uint8_t fl = 0U;
-        if ((l >= CORNER_SIDE_FULL) && (r < CORNER_SIDE_FULL)) fl |= 0x01U;
-        if ((r >= CORNER_SIDE_FULL) && (l < CORNER_SIDE_FULL)) fl |= 0x02U;
+        /* [CW5 2026-11-28] 加入不对称分支：一侧 >=5 且另一侧 <=1 也算全亮。
+           见 car_config.h 里 CORNER_CW5_ENABLE 的说明。 */
+        if (((l >= CORNER_SIDE_FULL) && (r < CORNER_SIDE_FULL)) ||
+            ((l >= CORNER_SIDE_HI)   && (r <= CORNER_SIDE_LO)))     fl |= 0x01U;
+        if (((r >= CORNER_SIDE_FULL) && (l < CORNER_SIDE_FULL)) ||
+            ((r >= CORNER_SIDE_HI)   && (l <= CORNER_SIDE_LO)))     fl |= 0x02U;
         if (cnt == 0) fl |= 0x04U;
         if (centered != 0U) fl |= 0x08U;        /* bit3 = 质心居中 */
         CwLog_Push(cnt, mask, error, fl);
@@ -563,8 +567,10 @@ static void Corner_Watch(CornerState *c, uint16_t mask, int cnt, float error,
         /* 1) 一侧全亮、另一侧没全亮：拐角的"L"形。
               "另一侧也没全亮"用来排除 12 路全亮的地面标记。 */
         {
-            uint8_t full_l = (uint8_t)((l >= CORNER_SIDE_FULL) && (r < CORNER_SIDE_FULL));
-            uint8_t full_r = (uint8_t)((r >= CORNER_SIDE_FULL) && (l < CORNER_SIDE_FULL));
+            uint8_t full_l = (uint8_t)(((l >= CORNER_SIDE_FULL) && (r < CORNER_SIDE_FULL)) ||
+                                       ((l >= CORNER_SIDE_HI)   && (r <= CORNER_SIDE_LO)));
+            uint8_t full_r = (uint8_t)(((r >= CORNER_SIDE_FULL) && (l < CORNER_SIDE_FULL)) ||
+                                       ((r >= CORNER_SIDE_HI)   && (l <= CORNER_SIDE_LO)));
 
             if (full_l || full_r)
             {
